@@ -545,7 +545,8 @@ window.__ModuleLoader__.load({
           }
           setMigrateOpen(false);
           setMigrateToken('');
-          if (!form.codeDir) {
+          var codeDirChanged = form.codeDir !== targetRoot;
+          if (codeDirChanged) {
             setForm(function (current) {
               var next = Object.assign({}, current || {});
               next.codeDir = targetRoot;
@@ -557,7 +558,7 @@ window.__ModuleLoader__.load({
             kind: 'ok',
             text: (result.text || '迁移完成，建议立即执行一键同步并重启 DSH')
               + (moved ? '（已收编 ' + moved + ' 个旧工作区）' : '')
-              + (!form.codeDir ? ' 已填入代码目录，请点「保存设置」。' : ''),
+              + (codeDirChanged ? ' 已填入代码目录，请点「保存设置」。' : ''),
           });
           st.refresh();
         }).catch(function (cause) {

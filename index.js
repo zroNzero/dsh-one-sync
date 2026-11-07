@@ -1104,7 +1104,9 @@ function installRoutes(webCtx) {
         sendJson(res, 200, {
           ...report,
           ok: true,
-          text: '迁移完成，建议立即执行一键同步并重启 DSH',
+          text: report.moved.length > 0
+            ? '迁移完成，建议立即执行一键同步并重启 DSH'
+            : (report.text || '没有需要收编的旧工作区。'),
         })
       } catch (error) {
         const message = redact(messageOf(error), { token })
