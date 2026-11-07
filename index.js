@@ -21,6 +21,7 @@
  *   POST /sync     执行一次完整同步
  */
 import fs from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { performance } from 'node:perf_hooks'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,6 +34,7 @@ import {
   keyCachePath,
   keyEncPath,
   loadConfig,
+  normalizeCodeDir,
   normalizeConfig,
   publicConfig,
   readStatus,
@@ -43,6 +45,7 @@ import {
 } from './lib/config.js'
 import { DEFAULT_KDF, unwrapKey } from './lib/crypto.js'
 import { publishNewRepo } from './lib/github-publisher.js'
+import { GithubRest } from './lib/rest.js'
 import { migrateToMonorepo } from './lib/migrator.js'
 import { RELEASE_REPO, previewRelease, releasePlugin } from './lib/release.js'
 import { RestTransport, SyncError, createTimings, describePaths, deviceName, pullState, pushState } from './lib/sync-core.js'
@@ -928,6 +931,75 @@ async function resetLocalState() {
   ])
 }
 
+export async function initializeFromBody(body = {}) {
+  const src = body && typeof body === 'object' ? body : {}
+  const current = await loadConfig().catch(() => null)
+  const token = String(src.token || (current && current.token) || '').trim()
+  if (!token) return { ok: false, error: '请先填写 GitHub Token' }
+
+  const passphrase = typeof src.passphrase === 'string' && src.passphrase !== ''
+    ? src.passphrase
+    : String((current && current.passphrase) || '')
+  if (!passphrase) return { ok: false, error: '请填写加密口令' }
+
+  const branch = String(src.branch || (current && current.branch) || 'main').trim() || 'main'
+  let stateRepo = String(src.stateRepo || '').trim()
+  const codeInput = String(src.codeDir || '').trim()
+  let codeDir = codeInput || join(homedir(), 'Documents', 'DSH_Workspace')
+
+  try {
+    codeDir = normalizeCodeDir(codeDir)
+  } catch (error) {
+    return { ok: false, error: messageOf(error) }
+  }
+
+  try {
+    const userRest = new GithubRest({
+      remote: stateRepo || 'https://github.com/unknown/unknown.git',
+      token,
+      branch,
+    }, () => {})
+    const user = await userRest.request('GET', '/user')
+    const login = user && user.login
+    if (!login) return { ok: false, error: '无法获取 GitHub 用户名' }
+    if (!stateRepo) stateRepo = `https://github.com/${login}/dsh-state.git`
+
+    await fs.mkdir(codeDir, { recursive: true })
+    const stat = await fs.stat(codeDir)
+    if (!stat.isDirectory()) return { ok: false, error: '工作区路径不是文件夹' }
+
+    const repoRest = new GithubRest({ remote: stateRepo, token, branch }, () => {})
+    let createdRepo = false
+    if (!(await repoRest.repoExists())) {
+      await repoRest.createRepo()
+      createdRepo = true
+    }
+
+    const result = await saveConfigFromBody({
+      ...src,
+      codeDir,
+      stateRepo,
+      token,
+      passphrase,
+      branch,
+      autoSync: true,
+      autoSyncDelaySec: src.autoSyncDelaySec === undefined
+        ? (current && current.autoSyncDelaySec)
+        : src.autoSyncDelaySec,
+    })
+    if (!result.ok) return result
+    return {
+      ...result,
+      initialized: true,
+      login,
+      createdRepo,
+      defaults: { stateRepo, codeDir },
+    }
+  } catch (error) {
+    return { ok: false, error: messageOf(error) }
+  }
+}
+
 async function saveConfigFromBody(body) {
   const src = body && typeof body === 'object' ? body : {}
   const current = await loadConfig()
@@ -1106,6 +1178,14 @@ function installRoutes(webCtx) {
     POST: async (req, res) => {
       const body = await readJsonBody(req)
       const result = await saveConfigFromBody(body)
+      sendJson(res, result.ok ? 200 : 400, result)
+    },
+  })
+
+  install(`${API_PREFIX}/init`, {
+    POST: async (req, res) => {
+      const body = await readJsonBody(req)
+      const result = await initializeFromBody(body)
       sendJson(res, result.ok ? 200 : 400, result)
     },
   })

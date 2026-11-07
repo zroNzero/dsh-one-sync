@@ -4,7 +4,12 @@ import { releasePlugin, previewRelease, RELEASE_REPO } from '../lib/release.js'
 const args = process.argv.slice(2)
 const preview = args.includes('--preview')
 const bumpArg = args.find((arg) => arg.startsWith('--bump='))
-const bump = bumpArg ? bumpArg.slice('--bump='.length) : 'minor'
+const bumpIndex = args.indexOf('--bump')
+const bump = bumpArg
+  ? bumpArg.slice('--bump='.length)
+  : (bumpIndex >= 0 && args[bumpIndex + 1] && !args[bumpIndex + 1].startsWith('--')
+    ? args[bumpIndex + 1]
+    : 'minor')
 const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || ''
 
 try {

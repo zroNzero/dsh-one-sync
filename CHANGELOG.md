@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] - 2026-11-07
+
+### Added
+
+- One-click setup with GitHub username and default workspace detection.
+- Token help for the required fine-grained permissions.
+
+### Fixed
+
+- Migration now removes empty parent directories left behind by moved workspaces.
+- Token and passphrase guidance is back in Chinese.
+
 ## [1.1.0] - 2026-11-07
 
 ### Added

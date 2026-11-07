@@ -316,6 +316,11 @@ window.__ModuleLoader__.load({
       'min-width:210px;max-width:100%;outline:none;box-sizing:border-box;}',
       '.os-input:focus{border-color:var(--dsw-alias-brand-primary,#0969da);}',
       '.os-input.os-num{min-width:80px;width:100px;}',
+      '.os-token-row{display:flex;align-items:center;gap:6px;width:100%;}',
+      '.os-token-row .os-input{flex:1;}',
+      '.os-help{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;',
+      'border:1px solid var(--dsw-alias-border-l1,#d0d7de);border-radius:50%;flex:none;',
+      'font-size:11px;color:var(--dsw-alias-label-secondary,#57606a);cursor:help;}',
       '.os-check{width:16px;height:16px;accent-color:var(--dsw-alias-brand-primary,#0969da);}',
       '.os-btns{display:flex;flex-wrap:wrap;gap:8px;align-items:center;}',
       '.os-btn{border:1px solid var(--dsw-alias-border-l1,#d0d7de);border-radius:8px;',
@@ -492,6 +497,9 @@ window.__ModuleLoader__.load({
       var busyState = useState('');
       var busy = busyState[0];
       var setBusy = busyState[1];
+      var initializingState = useState(false);
+      var initializing = initializingState[0];
+      var setInitializing = initializingState[1];
       var loadedRef = useRef(false);
       var publishOpenState = useState(false);
       var publishOpen = publishOpenState[0];
@@ -562,7 +570,7 @@ window.__ModuleLoader__.load({
       };
 
       var save = function () {
-        if (!form || busy || syncing) return;
+        if (!form || busy || syncing || initializing) return;
         setBusy('save');
         var payload = {
           codeDir: form.codeDir,
@@ -594,8 +602,47 @@ window.__ModuleLoader__.load({
         });
       };
 
+      var initialize = function () {
+        if (!form || busy || syncing || initializing) return;
+        if (!form.passphrase && !meta.hasPassphrase) {
+          setMsg({ kind: 'err', text: '请填写加密口令' });
+          return;
+        }
+        if (!String(form.token || '').trim() && !meta.hasToken) {
+          setMsg({ kind: 'err', text: '请先填写 Token' });
+          return;
+        }
+        setInitializing(true);
+        setMsg({ kind: 'info', text: '正在初始化…' });
+        apiPost('/init', {
+          codeDir: form.codeDir,
+          stateRepo: form.stateRepo,
+          token: form.token,
+          passphrase: form.passphrase,
+          branch: form.branch,
+          deviceName: form.deviceName,
+          maxFileMb: Number(form.maxFileMb) || 45,
+          rememberKey: form.rememberKey !== false,
+          autoSyncDelaySec: Number(form.autoSyncDelaySec) || 5,
+        }).then(function (result) {
+          if (!result || result.ok === false) {
+            throw new Error((result && result.error) || '初始化失败');
+          }
+          applyConfig(result.config || {});
+          setMsg({
+            kind: 'ok',
+            text: result.createdRepo ? '初始化完成，已创建备份仓库' : '初始化完成',
+          });
+          syncStore.refresh();
+          setInitializing(false);
+        }).catch(function (cause) {
+          setInitializing(false);
+          setMsg({ kind: 'err', text: '初始化失败：' + errText(cause) });
+        });
+      };
+
       var syncNow = function () {
-        if (busy || syncing) return;
+        if (busy || syncing || initializing) return;
         setMsg({ kind: 'info', text: '同步中…' });
         syncStore.runSync().then(function (outcome) {
           setMsg({
@@ -606,7 +653,7 @@ window.__ModuleLoader__.load({
       };
 
       var clearToken = function () {
-        if (busy || syncing) return;
+        if (busy || syncing || initializing) return;
         if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
           if (!window.confirm('清除已保存的 Token？')) return;
         }
@@ -626,14 +673,14 @@ window.__ModuleLoader__.load({
       };
 
       var openPublish = function () {
-        if (!form || busy || syncing) return;
+        if (!form || busy || syncing || initializing) return;
         setPublishName(suggestRepoName(form.codeDir));
         setPublishOpen(true);
         setMsg(null);
       };
 
       var publishToNewRepo = function () {
-        if (!form || busy || syncing) return;
+        if (!form || busy || syncing || initializing) return;
         var name = String(publishName || '').trim();
         if (!name) {
           setMsg({ kind: 'err', text: '仓库名不能为空' });
@@ -660,7 +707,7 @@ window.__ModuleLoader__.load({
       };
 
       var openMigrate = function () {
-        if (!form || busy || syncing) return;
+        if (!form || busy || syncing || initializing) return;
         setMigrateRoot(form.codeDir || '');
         setMigrateRepo('');
         setMigrateToken('');
@@ -669,7 +716,7 @@ window.__ModuleLoader__.load({
       };
 
       var runMigrate = function () {
-        if (!form || busy || syncing) return;
+        if (!form || busy || syncing || initializing) return;
         var targetRoot = String(migrateRoot || form.codeDir || '').trim();
         if (!targetRoot) {
           setMsg({ kind: 'err', text: '工作区根目录不能为空' });
@@ -732,38 +779,44 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               className: 'os-btn primary',
+              onClick: initialize,
+              disabled: initializing || syncing,
+            }, initializing ? '初始化中' : '一键初始化'),
+            h('button', {
+              type: 'button',
+              className: 'os-btn',
               onClick: syncNow,
-              disabled: syncing,
+              disabled: syncing || initializing,
             }, syncing ? '同步中' : '同步'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: save,
-              disabled: busy === 'save' || syncing,
+              disabled: busy === 'save' || syncing || initializing,
             }, busy === 'save' ? '保存中' : '保存'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: function () { syncStore.refresh(); },
-              disabled: syncing,
+              disabled: syncing || initializing,
             }, '刷新'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: openPublish,
-              disabled: busy === 'publish' || syncing,
+              disabled: busy === 'publish' || syncing || initializing,
             }, busy === 'publish' ? '发布中' : '发布'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: openMigrate,
-              disabled: busy === 'migrate' || syncing,
+              disabled: busy === 'migrate' || syncing || initializing,
             }, busy === 'migrate' ? '收编中' : '收编'),
             meta.hasToken ? h('button', {
               type: 'button',
               className: 'os-btn danger',
               onClick: clearToken,
-              disabled: busy === 'token' || syncing,
+              disabled: busy === 'token' || syncing || initializing,
             }, busy === 'token' ? '清除中' : '清除') : null,
           ),
           msg ? h('div', {
@@ -884,13 +937,20 @@ window.__ModuleLoader__.load({
           h(Row, {
             title: 'GitHub Token',
             hint: '需要仓库读写权限',
-          }, h(TextInput, {
-            type: 'password',
-            value: v('token'),
-            placeholder: tokenPlaceholder,
-            autoComplete: 'new-password',
-            onChange: function (value) { return patch('token', value); },
-          })),
+          }, h('div', { className: 'os-token-row' },
+            h(TextInput, {
+              type: 'password',
+              value: v('token'),
+              placeholder: tokenPlaceholder,
+              autoComplete: 'new-password',
+              onChange: function (value) { return patch('token', value); },
+            }),
+            h('span', {
+              className: 'os-help',
+              title: '生成 Fine-grained Token，勾选 Contents 和 Administration（读写）',
+              'aria-label': 'Token 帮助',
+            }, '?'),
+          )),
           h(Row, {
             title: '记住加密密钥',
             hint: '开启后在本机缓存密钥',
