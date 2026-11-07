@@ -653,6 +653,7 @@ function describeReport(report) {
         stateBits.push(`跳过 ${statePush.skipped.length} 个文件`)
       }
     }
+    if (statePush.migrated) stateBits.push(`迁移旧会话目录 ${statePush.migrated}`)
     if (statePush.deleted) stateBits.push(`删除 ${statePush.deleted}`)
   }
   if (stateBits.length) parts.push('状态：' + stateBits.join('，'))
@@ -718,6 +719,7 @@ function summarizeReport(report) {
           pushed: Boolean(push.pushed),
           uploaded: push.uploaded || 0,
           deleted: push.deleted || 0,
+          migrated: push.migrated || 0,
           preservedRemote: push.preservedRemote || 0,
           files: push.files || 0,
           unchanged: Boolean(push.unchanged),

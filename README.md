@@ -100,6 +100,14 @@ D:\PC\dsh_sync\dsh-sync
 3. **Git Push**：在 Git 根目录再次兜底提交，`push origin <branch>`；远端领先时自动 rebase 后重试一次。不会强推。本地新建的工作区文件会在这一步提交并推送。
 4. **Push State**：扫描状态 → `encryptFile` → 与 `stateRepo` 的远端树按 git blob sha 比对 → `commitFiles` 一个原子提交。清单是「本地 + 远端」的并集：**本机没扫描到的远端会话不会被删除**，只会上传本机新增/修改的文件。状态拉取失败时本轮跳过状态上传，避免覆盖远端。
 
+## 会话目录跨路径重映射
+
+DSH 的 `sessions/<workspaceKey>/` 目录名由工作区绝对路径编码（`projectKey(cwd)`）。插件在两台电脑之间用**相对路径**作为仓库里的标准 key：
+
+- Push：本地 `sessions/--D-PC-dsh-projectA--/`（本机绝对路径编码）按 `workspace.json` 反查工作区，上传到 `state/sessions/--.-projectA--/`；同时把会话 header 的 `cwd` 统一成远端已有的值。
+- Pull：远端 `--.-projectA--` 用当前 `gitRoot` 还原为 `C:\dsh\projectA`，再用 `encodeWorkspaceKey()` 算出本机目录名 `--C-dsh-projectA--`；写入前把会话 header 的 `cwd` 改为 `C:\dsh\projectA`。DSH 重启后按本机目录和 header 都能直接读取。
+- 旧格式：绝对路径编码的远端会话会被 Pull 正常读取；Push 时自动改存到相对路径 key，并在同一个原子提交里删除旧路径，避免同一 session id 出现两份。只重写第一个 zstd frame 的 header，后续所有对话 frame 逐字节保留。
+
 ## 状态仓库布局
 
 ```text
@@ -147,7 +155,6 @@ state/configs/settings.yaml.dshx
 - 非空仓库不会替你新建状态分支：如果设置的分支不存在，请先在 GitHub 创建，或把「分支」改成已存在的分支。
 - `stateRepo` 与代码仓库彻底分离；发布新代码仓库不会修改 `stateRepo`，状态同步也不会写入代码仓库。
 - 两机同时同步时，状态提交可能发生 ref 竞争；建议避免同一时刻点击同步。
-- 工作区条目按路径并集，但 DSH 的会话目录名仍由本机绝对路径编码。两台 `codeDir` 使用相同绝对路径时，会话可以直接显示在对应工作区；完全不同的绝对路径目前只能保证会话文件被拉取，不能保证 DSH 自动挂到同名工作区下。
 - 修改 `passphrase` 不会自动重新包装远端 `key.enc`。忘记口令需要两台电脑一起删除本机 `one-sync/key` 与远端 `key.enc` 后重置。
 - 正在被 DSH 写入的会话文件在 Windows 上可能短暂无法覆盖；该文件会被跳过，下次同步再试。
 - 代码同步使用 Git 根目录自己的 `origin`；`stateRepo` 只用于 DSH 状态仓库。
