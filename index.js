@@ -1,11 +1,12 @@
 /**
  * dsh-one-sync —— Host 半身。
  *
- * 一次「一键同步」的顺序（与需求一致）：
+ * 一次「一键同步」的顺序：
  *   1. Git Pull            在 Git 根目录拉取代码
- *   2. Pull State          使用独立的 stateRepo 拉取 DSH 状态密文 → 解密 → 写入
- *   3. Git Push            在 Git 根目录提交并推送代码
- *   4. Push State          使用 stateRepo 加密上传 DSH 状态
+ *   2. Pull State          拉取 DSH 状态密文 → 解密 → 与本地 workspace.json
+ *                          做路径并集 → 从代码大仓补齐缺失的工作区目录
+ *   3. Git Push            提交并推送本机新增代码（含刚补回的工作区）
+ *   4. Push State          把并集后的状态加密上传；远端独有文件绝不删除
  *
  * 配置：~/.dsh/one-sync.json（codeDir / stateRepo / token / passphrase 等）。
  * 代码仓库与状态仓库彻底分离：codeDir 只表示当前工作区，代码 Git 操作会自动
@@ -18,7 +19,7 @@
  *   POST /sync     执行一次完整同步
  */
 import fs from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { findGitRoot, runGit } from './lib/git.js'
 import {
   ConfigError,
@@ -129,6 +130,112 @@ function samePath(a, b) {
   return process.platform === 'win32'
     ? left.toLowerCase() === right.toLowerCase()
     : left === right
+}
+
+/** 返回 child 相对 root 的路径；不在 root 下时返回 null。 */
+function relativeToRoot(root, child) {
+  if (!root || !child) return null
+  const rel = relative(resolve(root), resolve(child))
+  if (!rel) return ''
+  if (isAbsolute(rel) || rel === '..' || rel.startsWith('..\\') || rel.startsWith('../')) {
+    return null
+  }
+  return rel
+}
+
+/**
+ * 远端 workspace.json 合并后，把本机缺失的工作区目录从代码大仓恢复出来。
+ *
+ * 1. 目录已在 → 不动；
+ * 2. 大仓里有该路径的已跟踪文件 → git checkout 恢复；
+ * 3. 大仓里没有（例如只建了空工作区）→ 创建空目录，避免 DSH 打开失败。
+ *
+ * 只读 checkout，不覆盖本机已有文件；任何一步失败都只记录，不阻断状态同步。
+ */
+export async function restoreWorkspaceDirs(config, gitRoot, branch, workspaces, say) {
+  const result = {
+    ok: true,
+    checked: 0,
+    restored: 0,
+    created: 0,
+    skipped: [],
+    failed: [],
+  }
+  if (!gitRoot) {
+    result.ok = false
+    result.skipped.push({ reason: '当前没有可用的 Git 根目录' })
+    return result
+  }
+
+  const refs = [branch, branch ? `origin/${branch}` : '', 'HEAD'].filter(Boolean)
+  for (const workspace of Array.isArray(workspaces) ? workspaces : []) {
+    const rawPath = workspace && workspace.path
+    if (typeof rawPath !== 'string' || !rawPath || !isAbsolute(rawPath)) continue
+    const abs = resolve(rawPath)
+    const rel = relativeToRoot(gitRoot, abs)
+    if (rel === null) {
+      result.skipped.push({ path: abs, reason: '工作区不在当前代码大仓内' })
+      continue
+    }
+    result.checked += 1
+    if (!rel) continue // gitRoot 本身
+
+    let stat = null
+    try {
+      stat = await fs.stat(abs)
+    } catch {
+      /* 目录不存在，继续恢复 */
+    }
+    if (stat && stat.isDirectory()) continue
+    if (stat) {
+      result.failed.push({ path: abs, reason: '同名路径已存在但不是文件夹' })
+      continue
+    }
+
+    let lastError = ''
+    let checkedOut = false
+    const pathspec = rel.replace(/\\/g, '/')
+    for (const ref of refs) {
+      const checkout = await gitIn(gitRoot, config, ['checkout', ref, '--', pathspec])
+      if (checkout.ok) {
+        checkedOut = true
+        break
+      }
+      lastError = checkout.error || lastError
+    }
+
+    let madeDir = false
+    if (!checkedOut) {
+      // 空目录无法进入 Git；创建它让 DSH 至少能打开工作区。
+      // 如果有未跟踪文件占用同名路径，stat 早就命中，不会走到这里。
+      try {
+        await fs.mkdir(abs, { recursive: true })
+        madeDir = true
+      } catch (error) {
+        result.failed.push({ path: abs, reason: messageOf(error) || lastError })
+        continue
+      }
+    }
+
+    try {
+      const after = await fs.stat(abs)
+      if (!after.isDirectory()) throw new Error('恢复后的路径不是文件夹')
+    } catch (error) {
+      result.failed.push({ path: abs, reason: messageOf(error) || lastError })
+      continue
+    }
+
+    if (checkedOut) {
+      result.restored += 1
+      say(`已从代码大仓恢复工作区：${rel}`)
+    } else if (madeDir) {
+      result.created += 1
+      say(`已创建空工作区目录（大仓中暂无此路径）：${rel}`)
+    }
+  }
+
+  result.ok = result.failed.length === 0
+  return result
 }
 
 async function prepareCodeRepo(config, say, options = {}) {
@@ -366,11 +473,31 @@ export async function onSync(ctx = {}) {
       report.errors.push('代码拉取：' + report.code.pull.error)
     }
 
-    // 2. 拉取状态并解密写入
+    // 2. 拉取状态、合并工作区，并从代码大仓补齐缺失目录
     const gitRoot = (report.code.pull && report.code.pull.gitRoot) || ''
-    say('2/4 拉取 DSH 状态并解密…')
+    const branch = (report.code.pull && report.code.pull.branch) || config.branch || 'main'
+    const codeUsable = !config.codeDir || Boolean(report.code.pull && report.code.pull.ok !== false)
+    say('2/4 拉取 DSH 状态、合并工作区并补齐缺失目录…')
     try {
-      report.state.pull = await pullState(config, { log: say, gitRoot })
+      report.state.pull = await pullState(config, {
+        log: say,
+        gitRoot,
+        branch,
+        ensureWorkspaceDirs: async ({ workspaces }) => {
+          if (!codeUsable || !gitRoot) {
+            return {
+              ok: true,
+              skipped: true,
+              reason: '代码拉取未成功或未配置代码目录',
+              checked: 0,
+              restored: 0,
+              created: 0,
+              failed: [],
+            }
+          }
+          return restoreWorkspaceDirs(config, gitRoot, branch, workspaces, say)
+        },
+      })
       if (report.state.pull.skipped && report.state.pull.skipped.length) {
         say(`状态拉取：${report.state.pull.skipped.length} 个文件跳过（详见同步结果）`)
       }
@@ -406,17 +533,16 @@ export async function onSync(ctx = {}) {
       }
     }
 
-    // 4. 扫描状态、加密并上传
-    const stateBlocked = report.state.pull
-      && report.state.pull.ok === false
-      && ['need-passphrase', 'bad-passphrase', 'state'].includes(report.state.pull.code)
+    // 4. 只有拉取成功才上传：否则本机版本可能覆盖远端刚创建、尚未拉下来的
+    // 会话/工作区，违背「绝对并集、互不覆盖」。
+    const stateBlocked = report.state.pull && report.state.pull.ok === false
     if (stateBlocked) {
       report.state.push = {
         ok: true,
         skipped: true,
-        reason: '状态拉取失败（口令/密钥不可用），已跳过上传',
+        reason: '状态拉取失败，已跳过上传以保护远端数据',
       }
-      say('状态口令不可用，跳过状态上传')
+      say('状态拉取失败，跳过状态上传')
     } else {
       say('4/4 加密并上传 DSH 状态…')
       try {
@@ -495,6 +621,13 @@ function describeReport(report) {
     stateBits.push('拉取失败')
   } else if (statePull) {
     stateBits.push(`拉取 ${statePull.applied || 0} 文件`)
+    if (statePull.workspaces) stateBits.push(`工作区并集 ${statePull.workspaces}`)
+    const restore = statePull.workspaceRestore
+    if (restore) {
+      if (restore.restored) stateBits.push(`恢复目录 ${restore.restored}`)
+      if (restore.created) stateBits.push(`新建空目录 ${restore.created}`)
+      if (restore.failed && restore.failed.length) stateBits.push(`目录失败 ${restore.failed.length}`)
+    }
     if (statePull.conflicts && statePull.conflicts.length) {
       const first = statePull.conflicts[0]
       const detail = first && (first.reason || first.remoteCopy || first.backup)
@@ -507,6 +640,7 @@ function describeReport(report) {
   } else if (statePush) {
     if (statePush.pushed) {
       stateBits.push(`上传 ${statePush.uploaded || 0} 个变更`)
+      if (statePush.preservedRemote) stateBits.push(`保留远端独有 ${statePush.preservedRemote}`)
       if (Array.isArray(statePush.skipped) && statePush.skipped.length) {
         stateBits.push(`跳过 ${statePush.skipped.length} 个文件`)
       }
@@ -514,6 +648,7 @@ function describeReport(report) {
       stateBits.push(statePush.reason || '跳过上传')
     } else {
       stateBits.push('已是最新')
+      if (statePush.preservedRemote) stateBits.push(`保留远端独有 ${statePush.preservedRemote}`)
       if (Array.isArray(statePush.skipped) && statePush.skipped.length) {
         stateBits.push(`跳过 ${statePush.skipped.length} 个文件`)
       }
@@ -561,6 +696,16 @@ function summarizeReport(report) {
           ok: pull.ok !== false,
           applied: pull.applied || 0,
           unchanged: pull.unchanged || 0,
+          workspaces: pull.workspaces || 0,
+          workspaceRestore: pull.workspaceRestore
+            ? {
+              ok: pull.workspaceRestore.ok !== false,
+              skipped: Boolean(pull.workspaceRestore.skipped),
+              restored: pull.workspaceRestore.restored || 0,
+              created: pull.workspaceRestore.created || 0,
+              failed: Array.isArray(pull.workspaceRestore.failed) ? pull.workspaceRestore.failed.length : 0,
+            }
+            : null,
           conflicts: Array.isArray(pull.conflicts) ? pull.conflicts.length : 0,
           keptLocal: Array.isArray(pull.keptLocal) ? pull.keptLocal.length : 0,
           skipped: Array.isArray(pull.skipped) ? pull.skipped.length : 0,
@@ -573,6 +718,7 @@ function summarizeReport(report) {
           pushed: Boolean(push.pushed),
           uploaded: push.uploaded || 0,
           deleted: push.deleted || 0,
+          preservedRemote: push.preservedRemote || 0,
           files: push.files || 0,
           unchanged: Boolean(push.unchanged),
         }

@@ -96,9 +96,9 @@ D:\PC\dsh_sync\dsh-sync
 ## 同步顺序
 
 1. **Git Pull**：先 `git rev-parse --show-toplevel` 找到 Git 根目录；`codeDir` 有未提交改动时在根目录自动 `commit`；然后 `pull --ff-only`，失败则 `pull --rebase`。冲突时执行 `git rebase --abort` 并报「代码产生冲突，已中止合并保护本地代码，请手动解决冲突后再试」。
-2. **Pull State**：使用 `stateRepo`（REST）读取 `key.enc` / `state/manifest.json` / `state/**/*.dshx`，用 `decryptFile` 解密；按三方基线合并写入 `~/.dsh/sessions`、`~/.dsh/storages`、`~/.dsh/memories`，并恢复 `configs` 分组里的 Profile 配置与 `settings.yaml`。
-3. **Git Push**：在 Git 根目录再次兜底提交，`push origin <branch>`；远端领先时自动 rebase 后重试一次。不会强推。
-4. **Push State**：扫描状态 → `encryptFile` → 与 `stateRepo` 的远端树按 git blob sha 比对 → `commitFiles` 一个原子提交；本地已删除的文件只在「扫描完整」的分组内从远端清理。
+2. **Pull State**：使用 `stateRepo`（REST）读取 `key.enc` / `state/manifest.json` / `state/**/*.dshx`，用 `decryptFile` 解密；按三方基线合并写入 `~/.dsh/sessions`、`~/.dsh/storages`、`~/.dsh/memories`，并恢复 `configs` 分组里的 Profile 配置与 `settings.yaml`。`workspace.json` 按**路径**与本地做并集：同一目录在 A/B 两台生成不同 UUID 时只保留一个工作区，双方的 `sessionIds` 合并。远端有、本地缺失的工作区目录会从代码大仓 `git checkout`；大仓里没有的空工作区则创建空目录。
+3. **Git Push**：在 Git 根目录再次兜底提交，`push origin <branch>`；远端领先时自动 rebase 后重试一次。不会强推。本地新建的工作区文件会在这一步提交并推送。
+4. **Push State**：扫描状态 → `encryptFile` → 与 `stateRepo` 的远端树按 git blob sha 比对 → `commitFiles` 一个原子提交。清单是「本地 + 远端」的并集：**本机没扫描到的远端会话不会被删除**，只会上传本机新增/修改的文件。状态拉取失败时本轮跳过状态上传，避免覆盖远端。
 
 ## 状态仓库布局
 
@@ -127,11 +127,12 @@ state/configs/settings.yaml.dshx
 | local == base | 采用远端 |
 | remote == base | 保留本机，等待下一次 push |
 | 会话：两边都改，且本机 mtime > 基线 | **保留本机**；远端版本另存为 `<name>.remote.jsonl.zstd`，不覆盖本地 |
+| 会话：首次同步双方已有同名文件，本机不旧于远端 | **保留本机**；远端版本另存为 `<name>.remote.jsonl.zstd` |
 | configs：本地与远端不同 | 远端覆盖本机；本机旧版备份到 `~/.dsh/one-sync/conflicts/` |
 | 其他两边都改 | 修改时间新者胜；远端较新则覆盖前备份到 `~/.dsh/one-sync/conflicts/` |
 | 没有 base（首次拉取） | 远端时间戳比本机新才覆盖，且先备份本机 |
 
-`.remote.jsonl.zstd` 副本只留在本机，扫描与 push 会排除它，不会再次上传。`pull` **不会删除本机文件**（避免误删活跃会话）；删除由后续 `push` 在可安全扫描的分组里传播。
+`.remote.jsonl.zstd` 副本只留在本机，扫描与 push 会排除它，不会再次上传。`pull` **不会删除本机文件**（避免误删活跃会话）；`push` **也不会自动删除远端独有文件**（它可能正是另一台电脑刚建的），因此状态仓库始终是两台设备的并集。
 
 ## 运行时要求
 
@@ -146,6 +147,7 @@ state/configs/settings.yaml.dshx
 - 非空仓库不会替你新建状态分支：如果设置的分支不存在，请先在 GitHub 创建，或把「分支」改成已存在的分支。
 - `stateRepo` 与代码仓库彻底分离；发布新代码仓库不会修改 `stateRepo`，状态同步也不会写入代码仓库。
 - 两机同时同步时，状态提交可能发生 ref 竞争；建议避免同一时刻点击同步。
+- 工作区条目按路径并集，但 DSH 的会话目录名仍由本机绝对路径编码。两台 `codeDir` 使用相同绝对路径时，会话可以直接显示在对应工作区；完全不同的绝对路径目前只能保证会话文件被拉取，不能保证 DSH 自动挂到同名工作区下。
 - 修改 `passphrase` 不会自动重新包装远端 `key.enc`。忘记口令需要两台电脑一起删除本机 `one-sync/key` 与远端 `key.enc` 后重置。
 - 正在被 DSH 写入的会话文件在 Windows 上可能短暂无法覆盖；该文件会被跳过，下次同步再试。
 - 代码同步使用 Git 根目录自己的 `origin`；`stateRepo` 只用于 DSH 状态仓库。
