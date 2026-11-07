@@ -108,6 +108,18 @@ DSH 的 `sessions/<workspaceKey>/` 目录名由工作区绝对路径编码（`pr
 - Pull：远端 `--.-projectA--` 用当前 `gitRoot` 还原为 `C:\dsh\projectA`，再用 `encodeWorkspaceKey()` 算出本机目录名 `--C-dsh-projectA--`；写入前把会话 header 的 `cwd` 改为 `C:\dsh\projectA`。DSH 重启后按本机目录和 header 都能直接读取。
 - 旧格式：绝对路径编码的远端会话会被 Pull 正常读取；Push 时自动改存到相对路径 key，并在同一个原子提交里删除旧路径，避免同一 session id 出现两份。只重写第一个 zstd frame 的 header，后续所有对话 frame 逐字节保留。
 
+## 收编旧工作区
+
+设置页 →「操作」→「收编旧工作区到大仓」：
+
+- 读取 `~/.dsh/storages/workspace.json`，找出所有不在 `targetRoot` 内的旧工作区；
+- 目标目录不存在时，用 `repoUrl` + `token` 自动 `git clone`；
+- 把旧目录移动到 `targetRoot/<目录名>`（重名自动加 `-2` 后缀）；
+- 把对应 `sessions/<旧绝对路径 key>/` 重命名成新 key，并只重写会话 header 的 `cwd`；
+- 更新 `workspace.json` 中的路径，并把原文件备份到 `~/.dsh/one-sync/conflicts/migrate/`。
+
+如果旧工作区已经存在于远端状态仓库，下一次「一键同步」会按 `sessionId` 把它归并到新路径，不会把旧工作区重新加回来。
+
 ## 状态仓库布局
 
 ```text

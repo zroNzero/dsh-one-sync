@@ -1,6 +1,6 @@
 {
   "name": "dsh-one-sync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 一键同步：Git 代码拉取/推送 + DSH 状态（sessions/storages/memories）加密上传/拉取；侧栏按钮与设置页配置。",
   "type": "module",
   "main": "./index.js",

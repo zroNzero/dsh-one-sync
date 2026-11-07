@@ -16,6 +16,8 @@
  *   GET  /status   运行状态（侧栏按钮与设置页轮询）
  *   GET  /config   读取配置（token/passphrase 不回显）
  *   POST /config   保存配置（口令会先用远端 key.enc 校验）
+ *   POST /publish  把当前代码目录发布为新的 GitHub 私密仓库
+ *   POST /migrate  把旧工作区移入大仓并改写 session 目录与 header
  *   POST /sync     执行一次完整同步
  */
 import fs from 'node:fs/promises'
@@ -38,6 +40,7 @@ import {
 } from './lib/config.js'
 import { DEFAULT_KDF, unwrapKey } from './lib/crypto.js'
 import { publishNewRepo } from './lib/github-publisher.js'
+import { migrateToMonorepo } from './lib/migrator.js'
 import { RestTransport, SyncError, describePaths, deviceName, pullState, pushState } from './lib/sync-core.js'
 
 export const name = 'dsh-one-sync'
@@ -769,6 +772,7 @@ export async function statusSnapshot() {
       status: `${API_PREFIX}/status`,
       config: `${API_PREFIX}/config`,
       sync: `${API_PREFIX}/sync`,
+      migrate: `${API_PREFIX}/migrate`,
     },
   }
 }
@@ -1056,6 +1060,59 @@ function installRoutes(webCtx) {
           htmlUrl: error && error.htmlUrl ? error.htmlUrl : undefined,
           commit: error && error.commit ? error.commit : undefined,
           pushed: false,
+        })
+      }
+    },
+  })
+
+  // 把旧工作区收编进大仓：移动目录 + 重映射 sessions key + 改写 header.cwd。
+  install(`${API_PREFIX}/migrate`, {
+    POST: async (req, res) => {
+      const body = await readJsonBody(req)
+      const targetRoot = typeof body.targetRoot === 'string' ? body.targetRoot.trim() : ''
+      const repoUrl = typeof body.repoUrl === 'string' ? body.repoUrl.trim() : ''
+      const bodyToken = typeof body.token === 'string' ? body.token.trim() : ''
+
+      let config = null
+      try {
+        config = await loadConfig()
+      } catch {
+        /* 配置读不到时仍允许使用请求体里的 token 做 clone */
+      }
+      const token = bodyToken || (config && config.token) || ''
+
+      if (!targetRoot) {
+        sendJson(res, 400, { ok: false, error: '请填写目标代码大仓根目录（targetRoot）。' })
+        return
+      }
+
+      try {
+        const report = await migrateToMonorepo({
+          targetRoot,
+          token,
+          repoUrl,
+          log: (message) => logInfo(null, message),
+        })
+        if (!report.ok) {
+          sendJson(res, 400, {
+            ...report,
+            error: report.text || '迁移未完成',
+            text: report.text || '迁移未完成',
+          })
+          return
+        }
+        sendJson(res, 200, {
+          ...report,
+          ok: true,
+          text: '迁移完成，建议立即执行一键同步并重启 DSH',
+        })
+      } catch (error) {
+        const message = redact(messageOf(error), { token })
+        sendJson(res, 400, {
+          ok: false,
+          error: message,
+          text: `迁移失败：${message}`,
+          code: error && error.code ? error.code : 'migrate',
         })
       }
     },

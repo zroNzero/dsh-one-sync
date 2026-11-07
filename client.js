@@ -8,6 +8,7 @@
  *   GET  /dsh-one-sync/api/status   运行状态
  *   GET  /dsh-one-sync/api/config   读取配置（token / 口令不回显）
  *   POST /dsh-one-sync/api/config   保存配置
+ *   POST /dsh-one-sync/api/migrate  收编旧工作区到大仓
  *   POST /dsh-one-sync/api/sync     一键同步
  */
 window.__ModuleLoader__.load({
@@ -168,6 +169,11 @@ window.__ModuleLoader__.load({
       '.os-msg.info{color:var(--dsw-alias-label-secondary,#57606a);}',
       '.os-pre{margin:0;max-height:240px;overflow:auto;font-size:11px;line-height:1.6;',
       'color:var(--dsw-alias-label-secondary,#57606a);white-space:pre-wrap;word-break:break-all;}',
+      '.os-progress{height:6px;border-radius:999px;overflow:hidden;margin-top:8px;',
+      'background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.16));}',
+      '.os-progress>i{display:block;height:100%;width:34%;border-radius:999px;',
+      'background:var(--dsw-alias-brand-primary,#0969da);animation:os-migrate-bar 1.1s ease-in-out infinite;}',
+      '@keyframes os-migrate-bar{0%{transform:translateX(-120%)}100%{transform:translateX(310%)}}',
       '.os-hint{color:var(--dsw-alias-label-secondary,#57606a);font-size:11px;line-height:1.6;}',
       '.os-list{margin:6px 0 0;padding-left:18px;font-size:12px;line-height:1.8;',
       'color:var(--dsw-alias-label-secondary,#57606a);}',
@@ -343,6 +349,18 @@ window.__ModuleLoader__.load({
       var publishNameState = useState('');
       var publishName = publishNameState[0];
       var setPublishName = publishNameState[1];
+      var migrateOpenState = useState(false);
+      var migrateOpen = migrateOpenState[0];
+      var setMigrateOpen = migrateOpenState[1];
+      var migrateRootState = useState('');
+      var migrateRoot = migrateRootState[0];
+      var setMigrateRoot = migrateRootState[1];
+      var migrateRepoState = useState('');
+      var migrateRepo = migrateRepoState[0];
+      var setMigrateRepo = migrateRepoState[1];
+      var migrateTokenState = useState('');
+      var migrateToken = migrateTokenState[0];
+      var setMigrateToken = migrateTokenState[1];
 
       var applyConfig = function (config) {
         var cfg = config || {};
@@ -493,6 +511,61 @@ window.__ModuleLoader__.load({
         });
       };
 
+      var openMigrate = function () {
+        if (!form || busy) return;
+        setMigrateRoot(form.codeDir || '');
+        setMigrateRepo('');
+        setMigrateToken('');
+        setMigrateOpen(true);
+        setMsg(null);
+      };
+
+      var runMigrate = function () {
+        if (!form || busy) return;
+        var targetRoot = String(migrateRoot || form.codeDir || '').trim();
+        if (!targetRoot) {
+          setMsg({ kind: 'err', text: '请填写目标代码大仓根目录。' });
+          return;
+        }
+        if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm('将把所有旧工作区移动到大仓根目录并改写历史会话，建议先备份 .dsh 目录。是否继续？')) return;
+        }
+        setBusy('migrate');
+        setMsg({
+          kind: 'info',
+          text: '正在收编旧工作区…（扫描 workspace.json → 移动目录 → 重映射 sessions → 改写 header.cwd）',
+        });
+        var payload = { targetRoot: targetRoot };
+        if (String(migrateRepo || '').trim()) payload.repoUrl = String(migrateRepo).trim();
+        if (String(migrateToken || '').trim()) payload.token = String(migrateToken).trim();
+        apiPost('/migrate', payload).then(function (result) {
+          setBusy('');
+          if (!result || result.ok === false) {
+            throw new Error((result && (result.error || result.text)) || '迁移失败');
+          }
+          setMigrateOpen(false);
+          setMigrateToken('');
+          if (!form.codeDir) {
+            setForm(function (current) {
+              var next = Object.assign({}, current || {});
+              next.codeDir = targetRoot;
+              return next;
+            });
+          }
+          var moved = result.moved && result.moved.length ? result.moved.length : 0;
+          setMsg({
+            kind: 'ok',
+            text: (result.text || '迁移完成，建议立即执行一键同步并重启 DSH')
+              + (moved ? '（已收编 ' + moved + ' 个旧工作区）' : '')
+              + (!form.codeDir ? ' 已填入代码目录，请点「保存设置」。' : ''),
+          });
+          st.refresh();
+        }).catch(function (cause) {
+          setBusy('');
+          setMsg({ kind: 'err', text: '迁移失败：' + errText(cause) });
+        });
+      };
+
       if (!form) {
         return h('div', { className: 'os-page' },
           msg ? h('div', { className: 'os-msg ' + (msg.kind || 'info') }, msg.text) : null,
@@ -537,6 +610,12 @@ window.__ModuleLoader__.load({
               onClick: openPublish,
               disabled: busy === 'publish',
             }, busy === 'publish' ? '发布中…' : '发布当前工作区为新库'),
+            h('button', {
+              type: 'button',
+              className: 'os-btn',
+              onClick: openMigrate,
+              disabled: busy === 'migrate',
+            }, busy === 'migrate' ? '迁移中…' : '收编旧工作区到大仓'),
             meta.hasToken ? h('button', {
               type: 'button',
               className: 'os-btn danger',
@@ -579,6 +658,48 @@ window.__ModuleLoader__.load({
             h('div', { className: 'os-hint' },
               'Token 需要创建仓库的权限：classic PAT 用 repo；fine-grained PAT 需要账号级 Repository creation / Administration write。' +
               '仓库名会被规范成 GitHub 可用的 slug。'),
+          ) : null,
+          migrateOpen ? h('div', { className: 'os-publish-panel' },
+            h('div', { className: 'os-hint' },
+              '把 workspace.json 中位于大仓外的旧工作区移动到 targetRoot 下，并重命名 sessions 目录、' +
+              '改写每个会话 header 的 cwd。移动前请先备份 ~/.dsh；目标目录已存在时会自动加后缀避免覆盖。'),
+            h('div', { className: 'os-publish-row' },
+              h(TextInput, {
+                value: migrateRoot,
+                placeholder: '目标大仓根目录，例如 D:\\PC\\dsh',
+                autoFocus: true,
+                onChange: function (value) { setMigrateRoot(value); },
+              }),
+            ),
+            h('div', { className: 'os-publish-row' },
+              h(TextInput, {
+                value: migrateRepo,
+                placeholder: 'repoUrl（targetRoot 不存在时用于 git clone，可选）',
+                onChange: function (value) { setMigrateRepo(value); },
+              }),
+            ),
+            h('div', { className: 'os-publish-row' },
+              h(TextInput, {
+                value: migrateToken,
+                placeholder: meta.hasToken ? 'Token 已保存，留空沿用' : 'GitHub Token（clone 私有仓库时用）',
+                onChange: function (value) { setMigrateToken(value); },
+              }),
+              h('button', {
+                type: 'button',
+                className: 'os-btn primary',
+                onClick: runMigrate,
+                disabled: busy === 'migrate',
+              }, busy === 'migrate' ? '迁移中…' : '确认收编'),
+              h('button', {
+                type: 'button',
+                className: 'os-btn',
+                onClick: function () { setMigrateOpen(false); },
+                disabled: busy === 'migrate',
+              }, '取消'),
+            ),
+            busy === 'migrate' ? h('div', { className: 'os-progress' }, h('i')) : null,
+            h('div', { className: 'os-hint' },
+              '迁移完成后建议立即执行一键同步并重启 DSH，让新的 workspace/session 路径生效。'),
           ) : null,
         ),
 
