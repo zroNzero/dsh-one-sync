@@ -1,0 +1,9 @@
+# dsh-one-sync —— 一键同步插件
+#
+# 由 DSH 的 bundle patch 机制在 profile 启动时插入本插件。
+# 真正的配置在 ~/.dsh/one-sync.json（设置页保存的就是它），
+# 所以这里不写任何敏感字段。
+- insert:
+    - id: dsh-one-sync
+      name: dsh-one-sync
+      config: {}
