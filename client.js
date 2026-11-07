@@ -9,7 +9,7 @@
  *   GET  /dsh-one-sync/api/config   读取配置（token / 口令不回显）
  *   POST /dsh-one-sync/api/config   保存配置
  *   POST /dsh-one-sync/api/migrate  收编旧工作区到大仓
- *   POST /dsh-one-sync/api/sync     一键同步
+ *   POST /dsh-one-sync/api/sync     同步
  */
 window.__ModuleLoader__.load({
   id: 'dsh-one-sync',
@@ -23,7 +23,6 @@ window.__ModuleLoader__.load({
     var useState = React.useState;
     var useEffect = React.useEffect;
     var useRef = React.useRef;
-    var useCallback = React.useCallback;
 
     var API = '/dsh-one-sync/api';
 
@@ -65,6 +64,40 @@ window.__ModuleLoader__.load({
         pad(date.getHours()) + ':' + pad(date.getMinutes());
     }
 
+    function fmtDuration(ms) {
+      var value = Number(ms);
+      if (!isFinite(value)) return '';
+      if (value < 1000) return Math.round(value) + 'ms';
+      var seconds = value / 1000;
+      return seconds.toFixed(seconds >= 10 || Math.floor(seconds) === seconds ? 0 : 1) + 's';
+    }
+
+    function fmtTimings(timings) {
+      if (!timings || typeof timings !== 'object') return '';
+      var labels = {
+        'Git pull': '拉取代码',
+        'State pull': '拉取备份',
+        'Git push': '推送代码',
+        'State push': '上传备份',
+        'State scan': '扫描',
+        'State prepare': '准备',
+        'State encrypt': '加密',
+        'Upload': '上传',
+        'Pull snapshot': '读取远端',
+        'Pull prepare': '准备拉取',
+        'Prefetch': '预取',
+        'Total': '总计',
+      };
+      var order = Object.keys(labels);
+      var names = order.filter(function (name) { return timings[name] !== undefined; });
+      Object.keys(timings).forEach(function (name) {
+        if (names.indexOf(name) < 0) names.push(name);
+      });
+      return names.map(function (name) {
+        return (labels[name] || name) + ': ' + fmtDuration(timings[name]);
+      }).join(' / ');
+    }
+
     /** 目录名 → GitHub 仓库名建议。 */
     function suggestRepoName(path) {
       var base = String(path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'my-project';
@@ -77,33 +110,171 @@ window.__ModuleLoader__.load({
       return slug || 'my-project';
     }
 
-    /** 状态轮询：侧栏按钮和设置页共用。 */
-    function useStatus(pollMs) {
-      var statusState = useState(null);
-      var status = statusState[0];
-      var setStatus = statusState[1];
-      var errorState = useState(null);
-      var error = errorState[0];
-      var setError = errorState[1];
-      var refresh = useCallback(function () {
-        return apiGet('/status').then(function (snapshot) {
-          setStatus(snapshot);
-          setError(null);
+    // ── 全局同步状态 store（侧栏与设置页共用同一个实例） ────────────────
+    function createSyncStore() {
+      var state = { status: null, error: null, syncing: false, lastResult: null };
+      var listeners = [];
+      var refreshPromise = null;
+      var syncPromise = null;
+      var timer = null;
+      var started = false;
+      var visibilityHandler = null;
+
+      function emit(patch) {
+        state = Object.assign({}, state, patch);
+        listeners.slice().forEach(function (listener) {
+          try { listener(state); } catch (error) { /* 单个订阅者失败不影响其它 UI */ }
+        });
+      }
+
+      function getSnapshot() { return state; }
+
+      function subscribe(listener) {
+        listeners.push(listener);
+        return function () {
+          var at = listeners.indexOf(listener);
+          if (at >= 0) listeners.splice(at, 1);
+        };
+      }
+
+      function busy() {
+        return state.syncing || Boolean(state.status && state.status.busy);
+      }
+
+      function schedule() {
+        if (!started) return;
+        if (timer !== null) clearTimeout(timer);
+        timer = setTimeout(function () {
+          timer = null;
+          if (typeof document !== 'undefined' && document.hidden) {
+            schedule();
+            return;
+          }
+          refresh();
+        }, busy() ? 1000 : 15000);
+      }
+
+      function refresh() {
+        if (refreshPromise) return refreshPromise;
+        var request = apiGet('/status').then(function (snapshot) {
+          emit({ status: snapshot, error: null });
           return snapshot;
         }).catch(function (cause) {
-          setError(errText(cause));
+          emit({ error: errText(cause) });
           return null;
         });
-      }, []);
+        refreshPromise = request.then(function (result) {
+          refreshPromise = null;
+          schedule();
+          return result;
+        });
+        return refreshPromise;
+      }
+
+      function refreshAfterCurrent() {
+        if (!started) return;
+        if (refreshPromise) {
+          refreshPromise.then(function () { refresh(); });
+        } else {
+          refresh();
+        }
+      }
+
+      function runSync() {
+        if (syncPromise) return syncPromise;
+        var initialStatus = state.status
+          ? Object.assign({}, state.status, { busy: true })
+          : null;
+        emit({ syncing: true, status: initialStatus, lastResult: null });
+        schedule();
+
+        syncPromise = apiPost('/sync', {}).then(function (report) {
+          var result = report && typeof report === 'object' ? report : {};
+          var text = result.text || result.error || (result.ok ? '同步完成' : '同步失败');
+          return {
+            ok: Boolean(result.ok),
+            text: text,
+            error: result.error || '',
+            report: result,
+            at: Date.now(),
+          };
+        }).catch(function (cause) {
+          var message = errText(cause);
+          return {
+            ok: false,
+            text: '同步失败：' + message,
+            error: message,
+            report: null,
+            at: Date.now(),
+          };
+        }).then(function (outcome) {
+          var nextStatus = state.status ? Object.assign({}, state.status) : null;
+          if (nextStatus) {
+            nextStatus.busy = Boolean(outcome.report && outcome.report.busy);
+            nextStatus.lastSyncAt = (outcome.report && outcome.report.at) || new Date(outcome.at).toISOString();
+            nextStatus.lastError = outcome.ok ? null : (outcome.error || outcome.text);
+            if (outcome.report && outcome.report.timings) {
+              nextStatus.timings = outcome.report.timings;
+              nextStatus.lastReport = Object.assign({}, nextStatus.lastReport || {}, {
+                timings: outcome.report.timings,
+              });
+            }
+          }
+          emit({ syncing: false, status: nextStatus, lastResult: outcome });
+          syncPromise = null;
+          refreshAfterCurrent();
+          return outcome;
+        });
+        return syncPromise;
+      }
+
+      function start() {
+        if (started) return;
+        started = true;
+        if (typeof document !== 'undefined') {
+          visibilityHandler = function () {
+            if (!document.hidden) refresh();
+          };
+          document.addEventListener('visibilitychange', visibilityHandler);
+        }
+        refresh();
+      }
+
+      function stop() {
+        started = false;
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (visibilityHandler && typeof document !== 'undefined') {
+          document.removeEventListener('visibilitychange', visibilityHandler);
+          visibilityHandler = null;
+        }
+      }
+
+      return {
+        getSnapshot: getSnapshot,
+        subscribe: subscribe,
+        refresh: refresh,
+        runSync: runSync,
+        start: start,
+        stop: stop,
+      };
+    }
+
+    var syncStore = createSyncStore();
+
+    function useSyncStore() {
+      var pair = useState(syncStore.getSnapshot());
+      var snapshot = pair[0];
+      var setSnapshot = pair[1];
 
       useEffect(function () {
-        refresh();
-        if (!pollMs) return undefined;
-        var timer = setInterval(refresh, pollMs);
-        return function () { clearInterval(timer); };
-      }, [refresh, pollMs]);
+        setSnapshot(syncStore.getSnapshot());
+        return syncStore.subscribe(setSnapshot);
+      }, []);
 
-      return { status: status, error: error, refresh: refresh };
+      return snapshot;
     }
 
     // ── 样式（只注入一次，前缀 os- 避免污染） ───────────────────────────
@@ -167,18 +338,12 @@ window.__ModuleLoader__.load({
       '.os-msg.err{border-color:var(--dsw-alias-state-error-primary,#cf222e);',
       'color:var(--dsw-alias-state-error-primary,#cf222e);}',
       '.os-msg.info{color:var(--dsw-alias-label-secondary,#57606a);}',
-      '.os-pre{margin:0;max-height:240px;overflow:auto;font-size:11px;line-height:1.6;',
-      'color:var(--dsw-alias-label-secondary,#57606a);white-space:pre-wrap;word-break:break-all;}',
       '.os-progress{height:6px;border-radius:999px;overflow:hidden;margin-top:8px;',
       'background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.16));}',
       '.os-progress>i{display:block;height:100%;width:34%;border-radius:999px;',
       'background:var(--dsw-alias-brand-primary,#0969da);animation:os-migrate-bar 1.1s ease-in-out infinite;}',
       '@keyframes os-migrate-bar{0%{transform:translateX(-120%)}100%{transform:translateX(310%)}}',
       '.os-hint{color:var(--dsw-alias-label-secondary,#57606a);font-size:11px;line-height:1.6;}',
-      '.os-list{margin:6px 0 0;padding-left:18px;font-size:12px;line-height:1.8;',
-      'color:var(--dsw-alias-label-secondary,#57606a);}',
-      'details.os-details>summary{cursor:pointer;font-size:12px;',
-      'color:var(--dsw-alias-label-secondary,#57606a);}',
     ].join('');
 
     function installStyles() {
@@ -191,28 +356,23 @@ window.__ModuleLoader__.load({
       return function () { tag.remove(); };
     }
 
-    // ── 侧栏「一键同步」按钮（sidebar.footer.action） ────────────────────
+    // ── 侧栏「同步」按钮（sidebar.footer.action） ────────────────────────
     function buildTitle(snapshot, error, flash) {
       if (flash) return flash.text;
-      if (error) return '一键同步：状态读取失败（' + error + '）';
-      if (!snapshot) return '一键同步：正在读取状态…';
+      if (error) return '同步不可用';
+      if (!snapshot) return '同步加载中';
       var config = snapshot.config || {};
-      var lines = [];
-      lines.push('一键同步（点击执行：拉取代码 → 拉取状态 → 推送代码 → 上传状态）');
-      lines.push('状态仓库：' + (config.stateRepo || '未配置'));
-      lines.push('代码目录：' + (config.codeDir || '未配置（只同步 DSH 状态）'));
-      lines.push('最近同步：' + fmtTime(snapshot.lastSyncAt));
-      if (!snapshot.configured) lines.push('尚未完成配置：请在「设置 → 一键同步」里填写');
-      if (snapshot.lastError) lines.push('最近错误：' + snapshot.lastError);
+      var lines = ['同步'];
+      lines.push('备份：' + (config.stateRepo ? '已配置' : '未配置'));
+      lines.push('工作区：' + (config.codeDir ? '已配置' : '未配置'));
+      lines.push('上次：' + fmtTime(snapshot.lastSyncAt));
+      if (snapshot.lastError) lines.push('错误：' + snapshot.lastError);
       return lines.join('\n');
     }
 
     function SyncButton(props) {
       var wide = Boolean(props && props.wide);
-      var st = useStatus(30000);
-      var busyState = useState(false);
-      var busy = busyState[0];
-      var setBusy = busyState[1];
+      var storeState = useSyncStore();
       var flashState = useState(null);
       var flash = flashState[0];
       var setFlash = flashState[1];
@@ -224,24 +384,18 @@ window.__ModuleLoader__.load({
       }, [flash]);
 
       var run = function () {
-        if (busy) return;
-        setBusy(true);
+        if (storeState.syncing || (storeState.status && storeState.status.busy)) return;
         setFlash(null);
-        apiPost('/sync', {}).then(function (result) {
-          setBusy(false);
+        syncStore.runSync().then(function (outcome) {
           setFlash({
-            kind: result && result.ok ? 'ok' : 'err',
-            text: (result && (result.text || result.error)) || '同步完成',
+            kind: outcome.ok ? 'ok' : 'err',
+            text: outcome.text || (outcome.ok ? '同步完成' : '同步失败'),
           });
-          st.refresh();
-        }).catch(function (cause) {
-          setBusy(false);
-          setFlash({ kind: 'err', text: '一键同步失败：' + errText(cause) });
         });
       };
 
-      var snapshot = st.status;
-      var running = busy || Boolean(snapshot && snapshot.busy);
+      var snapshot = storeState.status;
+      var running = storeState.syncing || Boolean(snapshot && snapshot.busy);
       var state = running ? 'busy'
         : flash ? (flash.kind === 'ok' ? 'ok' : 'err')
           : (snapshot && !snapshot.configured) ? 'off'
@@ -250,12 +404,12 @@ window.__ModuleLoader__.load({
       return h('button', {
         type: 'button',
         className: 'os-foot-btn' + (wide ? '' : ' os-only-ico') + (state ? ' os-state-' + state : ''),
-        title: buildTitle(snapshot, st.error, flash),
+        title: buildTitle(snapshot, storeState.error, flash),
         onClick: run,
         disabled: running,
       },
         h('span', { className: 'os-ico' + (running ? ' os-spin' : ''), 'aria-hidden': 'true' }, '⟳'),
-        wide ? h('span', null, '一键同步') : null,
+        wide ? h('span', null, running ? '同步中...' : '同步') : null,
       );
     }
 
@@ -288,26 +442,26 @@ window.__ModuleLoader__.load({
 
     function StatusCard(props) {
       var snapshot = props.status;
+      var syncing = Boolean(props.syncing || (snapshot && snapshot.busy));
       if (!snapshot) {
         return h('div', { className: 'os-card' },
           h('h3', null, '同步状态'),
-          h('div', { className: 'os-hint' }, '正在读取…'));
+          h('div', { className: 'os-hint' }, syncing ? '同步中…' : '加载中…'));
       }
       var config = snapshot.config || {};
+      var timingText = fmtTimings(snapshot.timings || (snapshot.lastReport && snapshot.lastReport.timings));
       var rows = [
-        ['配置', snapshot.configured ? '已配置' : '未完成（需要 stateRepo + token）'],
-        ['状态仓库', config.stateRepo || '未配置'],
-        ['代码目录', config.codeDir || '未配置（只同步 DSH 状态）'],
+        ['状态', syncing ? '同步中…' : '就绪'],
+        ['加密备份', config.stateRepo ? '已配置' : '未配置'],
+        ['工作区根目录', config.codeDir ? '已配置' : '未配置'],
         ['分支', snapshot.branch || 'main'],
-        ['本机设备', snapshot.device || '-'],
-        ['最近同步', fmtTime(snapshot.lastSyncAt)],
-        ['密钥', snapshot.hasKey ? '已就绪' : '尚未生成（首次同步需要口令）'],
-        ['状态目录', snapshot.stateDir || '-'],
-        ['配置文件', snapshot.configPath || '-'],
+        ['设备', snapshot.device || '-'],
+        ['上次同步', fmtTime(snapshot.lastSyncAt)],
+        ['加密', snapshot.hasKey ? '已就绪' : '待设置'],
       ];
-      if (snapshot.lastError) rows.push(['最近错误', snapshot.lastError]);
+      if (timingText) rows.push(['耗时', timingText]);
+      if (snapshot.lastError) rows.push(['错误', snapshot.lastError]);
 
-      var report = snapshot.lastReport;
       return h('div', { className: 'os-card' },
         h('h3', null, '同步状态'),
         snapshot.configError
@@ -319,17 +473,13 @@ window.__ModuleLoader__.load({
             h('span', { className: 'v', key: row[0] + '-v' }, row[1]),
           ];
         }).reduce(function (all, pair) { return all.concat(pair); }, [])),
-        report
-          ? h('details', { className: 'os-details', style: { marginTop: '10px' } },
-            h('summary', null, '最近一次同步详情'),
-            h('pre', { className: 'os-pre', style: { marginTop: '6px' } },
-              JSON.stringify(report, null, 2)))
-          : null,
       );
     }
 
     function SettingsPage() {
-      var st = useStatus(20000);
+      var storeState = useSyncStore();
+      var st = storeState.status;
+      var syncing = storeState.syncing || Boolean(st && st.busy);
       var formState = useState(null);
       var form = formState[0];
       var setForm = formState[1];
@@ -371,6 +521,8 @@ window.__ModuleLoader__.load({
           deviceName: cfg.deviceName || '',
           maxFileMb: cfg.maxFileMb === undefined ? 45 : cfg.maxFileMb,
           rememberKey: cfg.rememberKey !== false,
+          autoSync: cfg.autoSync === true,
+          autoSyncDelaySec: cfg.autoSyncDelaySec === undefined ? 5 : cfg.autoSyncDelaySec,
           token: '',
           passphrase: '',
         });
@@ -410,7 +562,7 @@ window.__ModuleLoader__.load({
       };
 
       var save = function () {
-        if (!form || busy) return;
+        if (!form || busy || syncing) return;
         setBusy('save');
         var payload = {
           codeDir: form.codeDir,
@@ -419,6 +571,8 @@ window.__ModuleLoader__.load({
           deviceName: form.deviceName,
           maxFileMb: Number(form.maxFileMb) || 45,
           rememberKey: form.rememberKey !== false,
+          autoSync: form.autoSync === true,
+          autoSyncDelaySec: Number(form.autoSyncDelaySec) || 5,
         };
         if (form.token.trim()) payload.token = form.token.trim();
         if (form.passphrase !== '') payload.passphrase = form.passphrase;
@@ -431,9 +585,9 @@ window.__ModuleLoader__.load({
           applyConfig(result.config || {});
           setMsg({
             kind: result.warning ? 'info' : 'ok',
-            text: result.warning || '设置已保存，并立即生效。',
+            text: result.warning || '已保存',
           });
-          st.refresh();
+          syncStore.refresh();
         }).catch(function (cause) {
           setBusy('');
           setMsg({ kind: 'err', text: '保存失败：' + errText(cause) });
@@ -441,26 +595,20 @@ window.__ModuleLoader__.load({
       };
 
       var syncNow = function () {
-        if (busy) return;
-        setBusy('sync');
-        setMsg({ kind: 'info', text: '正在同步…（代码 → 状态 → 代码 → 状态）' });
-        apiPost('/sync', {}).then(function (result) {
-          setBusy('');
+        if (busy || syncing) return;
+        setMsg({ kind: 'info', text: '同步中…' });
+        syncStore.runSync().then(function (outcome) {
           setMsg({
-            kind: result && result.ok ? 'ok' : 'err',
-            text: (result && (result.text || result.error)) || '同步完成',
+            kind: outcome.ok ? 'ok' : 'err',
+            text: outcome.text || (outcome.ok ? '同步完成' : '同步失败'),
           });
-          st.refresh();
-        }).catch(function (cause) {
-          setBusy('');
-          setMsg({ kind: 'err', text: '同步失败：' + errText(cause) });
         });
       };
 
       var clearToken = function () {
-        if (busy) return;
+        if (busy || syncing) return;
         if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
-          if (!window.confirm('确定清除已保存的 GitHub Token 吗？清除后状态同步会停止，直到重新填写。')) return;
+          if (!window.confirm('清除已保存的 Token？')) return;
         }
         setBusy('token');
         apiPost('/config', { clearToken: true }).then(function (result) {
@@ -470,7 +618,7 @@ window.__ModuleLoader__.load({
           }
           applyConfig(result.config || {});
           setMsg({ kind: 'ok', text: '已清除保存的 Token。' });
-          st.refresh();
+          syncStore.refresh();
         }).catch(function (cause) {
           setBusy('');
           setMsg({ kind: 'err', text: '清除失败：' + errText(cause) });
@@ -478,21 +626,21 @@ window.__ModuleLoader__.load({
       };
 
       var openPublish = function () {
-        if (!form || busy) return;
+        if (!form || busy || syncing) return;
         setPublishName(suggestRepoName(form.codeDir));
         setPublishOpen(true);
         setMsg(null);
       };
 
       var publishToNewRepo = function () {
-        if (!form || busy) return;
+        if (!form || busy || syncing) return;
         var name = String(publishName || '').trim();
         if (!name) {
-          setMsg({ kind: 'err', text: '请输入新仓库名称。' });
+          setMsg({ kind: 'err', text: '仓库名不能为空' });
           return;
         }
         setBusy('publish');
-        setMsg({ kind: 'info', text: '正在创建 GitHub 仓库并推送 Initial commit…' });
+        setMsg({ kind: 'info', text: '正在发布…' });
         apiPost('/publish', { repoName: name }).then(function (result) {
           setBusy('');
           if (!result || result.ok === false) {
@@ -502,9 +650,9 @@ window.__ModuleLoader__.load({
           setPublishName('');
           setMsg({
             kind: 'ok',
-            text: result.text || ('已发布到 ' + (result.htmlUrl || result.repoUrl || '') + '；stateRepo 未修改。'),
+            text: result.text || ('已发布到 ' + (result.htmlUrl || result.repoUrl || '') + '；加密备份未修改。'),
           });
-          st.refresh();
+          syncStore.refresh();
         }).catch(function (cause) {
           setBusy('');
           setMsg({ kind: 'err', text: '发布失败：' + errText(cause) });
@@ -512,7 +660,7 @@ window.__ModuleLoader__.load({
       };
 
       var openMigrate = function () {
-        if (!form || busy) return;
+        if (!form || busy || syncing) return;
         setMigrateRoot(form.codeDir || '');
         setMigrateRepo('');
         setMigrateToken('');
@@ -521,20 +669,17 @@ window.__ModuleLoader__.load({
       };
 
       var runMigrate = function () {
-        if (!form || busy) return;
+        if (!form || busy || syncing) return;
         var targetRoot = String(migrateRoot || form.codeDir || '').trim();
         if (!targetRoot) {
-          setMsg({ kind: 'err', text: '请填写目标代码大仓根目录。' });
+          setMsg({ kind: 'err', text: '工作区根目录不能为空' });
           return;
         }
         if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
-          if (!window.confirm('将把所有旧工作区移动到大仓根目录并改写历史会话，建议先备份 .dsh 目录。是否继续？')) return;
+          if (!window.confirm('收编旧工作区？')) return;
         }
         setBusy('migrate');
-        setMsg({
-          kind: 'info',
-          text: '正在收编旧工作区…（扫描 workspace.json → 移动目录 → 重映射 sessions → 改写 header.cwd）',
-        });
+        setMsg({ kind: 'info', text: '正在收编旧工作区…' });
         var payload = { targetRoot: targetRoot };
         if (String(migrateRepo || '').trim()) payload.repoUrl = String(migrateRepo).trim();
         if (String(migrateToken || '').trim()) payload.token = String(migrateToken).trim();
@@ -556,11 +701,11 @@ window.__ModuleLoader__.load({
           var moved = result.moved && result.moved.length ? result.moved.length : 0;
           setMsg({
             kind: 'ok',
-            text: (result.text || '迁移完成，建议立即执行一键同步并重启 DSH')
+            text: (result.text || '迁移完成')
               + (moved ? '（已收编 ' + moved + ' 个旧工作区）' : '')
-              + (codeDirChanged ? ' 已填入代码目录，请点「保存设置」。' : ''),
+              + (codeDirChanged ? ' 已填入工作区根目录' : ''),
           });
-          st.refresh();
+          syncStore.refresh();
         }).catch(function (cause) {
           setBusy('');
           setMsg({ kind: 'err', text: '迁移失败：' + errText(cause) });
@@ -570,20 +715,16 @@ window.__ModuleLoader__.load({
       if (!form) {
         return h('div', { className: 'os-page' },
           msg ? h('div', { className: 'os-msg ' + (msg.kind || 'info') }, msg.text) : null,
-          h('div', { className: 'os-hint' }, '正在读取一键同步设置…'),
+          h('div', { className: 'os-hint' }, '加载中…'),
         );
       }
 
       var v = function (key) { return form[key]; };
-      var tokenPlaceholder = meta.hasToken
-        ? '已保存（' + meta.tokenMasked + '），留空保持不变'
-        : 'github_pat_…（状态仓库 Contents 读写）';
-      var passphrasePlaceholder = meta.hasPassphrase
-        ? '已保存，留空保持不变'
-        : '首次同步必填；两台电脑必须一致';
+      var tokenPlaceholder = '粘贴你的 GitHub Token';
+      var passphrasePlaceholder = '输入加密口令';
 
       return h('div', { className: 'os-page' },
-        h(StatusCard, { status: st.status }),
+        h(StatusCard, { status: st, syncing: syncing }),
 
         h('div', { className: 'os-card' },
           h('h3', null, '操作'),
@@ -592,51 +733,49 @@ window.__ModuleLoader__.load({
               type: 'button',
               className: 'os-btn primary',
               onClick: syncNow,
-              disabled: busy === 'sync',
-            }, busy === 'sync' ? '同步中…' : '立即一键同步'),
+              disabled: syncing,
+            }, syncing ? '同步中' : '同步'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: save,
-              disabled: busy === 'save',
-            }, busy === 'save' ? '保存中…' : '保存设置'),
+              disabled: busy === 'save' || syncing,
+            }, busy === 'save' ? '保存中' : '保存'),
             h('button', {
               type: 'button',
               className: 'os-btn',
-              onClick: function () { st.refresh(); },
-            }, '刷新状态'),
+              onClick: function () { syncStore.refresh(); },
+              disabled: syncing,
+            }, '刷新'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: openPublish,
-              disabled: busy === 'publish',
-            }, busy === 'publish' ? '发布中…' : '发布当前工作区为新库'),
+              disabled: busy === 'publish' || syncing,
+            }, busy === 'publish' ? '发布中' : '发布'),
             h('button', {
               type: 'button',
               className: 'os-btn',
               onClick: openMigrate,
-              disabled: busy === 'migrate',
-            }, busy === 'migrate' ? '迁移中…' : '收编旧工作区到大仓'),
+              disabled: busy === 'migrate' || syncing,
+            }, busy === 'migrate' ? '收编中' : '收编'),
             meta.hasToken ? h('button', {
               type: 'button',
               className: 'os-btn danger',
               onClick: clearToken,
-              disabled: busy === 'token',
-            }, busy === 'token' ? '清除中…' : '清除 Token') : null,
+              disabled: busy === 'token' || syncing,
+            }, busy === 'token' ? '清除中' : '清除') : null,
           ),
           msg ? h('div', {
             className: 'os-msg ' + (msg.kind || 'info'),
             style: { marginTop: '10px' },
           }, msg.text) : null,
           publishOpen ? h('div', { className: 'os-publish-panel' },
-            h('div', { className: 'os-hint' },
-              '把当前代码目录初始化为新 Git 仓库，创建为 GitHub 私密仓库，并完成 Initial commit。' +
-              '已有 .git 的目录会被拒绝；发布只推送代码，不会修改 stateRepo。' +
-              '发布使用已保存的配置，修改上方字段后请先点「保存设置」。'),
+            h('div', { className: 'os-hint' }, '发布到新的私有仓库'),
             h('div', { className: 'os-publish-row' },
               h(TextInput, {
                 value: publishName,
-                placeholder: '新仓库名称，例如 my-project',
+                placeholder: '仓库名',
                 autoFocus: true,
                 onChange: function (value) { setPublishName(value); },
                 onKeyDown: function (event) {
@@ -648,7 +787,7 @@ window.__ModuleLoader__.load({
                 className: 'os-btn primary',
                 onClick: publishToNewRepo,
                 disabled: busy === 'publish',
-              }, busy === 'publish' ? '发布中…' : '确认发布'),
+              }, busy === 'publish' ? '发布中' : '发布'),
               h('button', {
                 type: 'button',
                 className: 'os-btn',
@@ -656,18 +795,13 @@ window.__ModuleLoader__.load({
                 disabled: busy === 'publish',
               }, '取消'),
             ),
-            h('div', { className: 'os-hint' },
-              'Token 需要创建仓库的权限：classic PAT 用 repo；fine-grained PAT 需要账号级 Repository creation / Administration write。' +
-              '仓库名会被规范成 GitHub 可用的 slug。'),
           ) : null,
           migrateOpen ? h('div', { className: 'os-publish-panel' },
-            h('div', { className: 'os-hint' },
-              '把 workspace.json 中位于大仓外的旧工作区移动到 targetRoot 下，并重命名 sessions 目录、' +
-              '改写每个会话 header 的 cwd。移动前请先备份 ~/.dsh；目标目录已存在时会自动加后缀避免覆盖。'),
+            h('div', { className: 'os-hint' }, '导入旧工作区'),
             h('div', { className: 'os-publish-row' },
               h(TextInput, {
                 value: migrateRoot,
-                placeholder: '目标大仓根目录，例如 D:\\PC\\dsh',
+                placeholder: '工作区根目录',
                 autoFocus: true,
                 onChange: function (value) { setMigrateRoot(value); },
               }),
@@ -675,14 +809,14 @@ window.__ModuleLoader__.load({
             h('div', { className: 'os-publish-row' },
               h(TextInput, {
                 value: migrateRepo,
-                placeholder: 'repoUrl（targetRoot 不存在时用于 git clone，可选）',
+                placeholder: '仓库地址（可选）',
                 onChange: function (value) { setMigrateRepo(value); },
               }),
             ),
             h('div', { className: 'os-publish-row' },
               h(TextInput, {
                 value: migrateToken,
-                placeholder: meta.hasToken ? 'Token 已保存，留空沿用' : 'GitHub Token（clone 私有仓库时用）',
+                placeholder: 'GitHub Token',
                 onChange: function (value) { setMigrateToken(value); },
               }),
               h('button', {
@@ -690,7 +824,7 @@ window.__ModuleLoader__.load({
                 className: 'os-btn primary',
                 onClick: runMigrate,
                 disabled: busy === 'migrate',
-              }, busy === 'migrate' ? '迁移中…' : '确认收编'),
+              }, busy === 'migrate' ? '收编中' : '收编'),
               h('button', {
                 type: 'button',
                 className: 'os-btn',
@@ -699,40 +833,38 @@ window.__ModuleLoader__.load({
               }, '取消'),
             ),
             busy === 'migrate' ? h('div', { className: 'os-progress' }, h('i')) : null,
-            h('div', { className: 'os-hint' },
-              '迁移完成后建议立即执行一键同步并重启 DSH，让新的 workspace/session 路径生效。'),
           ) : null,
         ),
 
         h('div', { className: 'os-card' },
-          h('h3', null, '代码与仓库'),
+          h('h3', null, '工作区与备份'),
           h(Row, {
-            title: '代码目录',
-            hint: '当前工作区绝对路径；插件会自动向上寻找 .git 根目录，并以根目录为单位 pull/push。留空 = 只同步 DSH 状态。',
+            title: '工作区根目录',
+            hint: '本地大仓的绝对路径',
           }, h(TextInput, {
             value: v('codeDir'),
-            placeholder: 'D:\\path\\to\\project',
+            placeholder: 'D:\\项目\\仓库',
             onChange: function (value) { return patch('codeDir', value); },
           })),
           h(Row, {
-            title: 'DSH 状态仓库',
-            hint: '只存 DSH 状态（sessions/storages/memories），与代码仓库完全分离。代码同步使用代码目录自己的 Git 根目录和 origin。',
+            title: '加密备份仓库',
+            hint: '填入你的私有 GitHub 仓库地址',
           }, h(TextInput, {
             value: v('stateRepo'),
-            placeholder: 'https://github.com/<用户名>/<状态仓库>.git',
+            placeholder: 'https://github.com/<用户名>/<仓库名>.git',
             onChange: function (value) { return patch('stateRepo', value); },
           })),
           h(Row, {
             title: '分支',
-            hint: '代码和状态共用；Git 根目录必须已检出这个分支，默认 main。',
+            hint: '代码和备份使用的分支，通常为 main',
           }, h(TextInput, {
             value: v('branch'),
             placeholder: 'main',
             onChange: function (value) { return patch('branch', value); },
           })),
           h(Row, {
-            title: '设备名',
-            hint: '两台电脑应不同；留空使用主机名。',
+            title: '设备名称',
+            hint: '留空自动使用主机名',
           }, h(TextInput, {
             value: v('deviceName'),
             placeholder: '自动',
@@ -740,7 +872,7 @@ window.__ModuleLoader__.load({
           })),
           h(Row, {
             title: '单文件上限（MB）',
-            hint: '超过上限的会话日志会被跳过（保留远端旧副本）。',
+            hint: '超过上限的文件会跳过',
           }, h(TextInput, {
             number: true,
             type: 'number',
@@ -751,7 +883,7 @@ window.__ModuleLoader__.load({
           })),
           h(Row, {
             title: 'GitHub Token',
-            hint: 'fine-grained PAT：状态仓库 Contents 读写；classic PAT：repo。代码仓库走 HTTPS 时也用它认证。只保存在本机配置，不会上传。',
+            hint: '需要仓库读写权限',
           }, h(TextInput, {
             type: 'password',
             value: v('token'),
@@ -760,8 +892,8 @@ window.__ModuleLoader__.load({
             onChange: function (value) { return patch('token', value); },
           })),
           h(Row, {
-            title: '记住主密钥',
-            hint: '开启后把主密钥缓存到本机（~/.dsh/one-sync/key），避免每次同步都跑 scrypt。',
+            title: '记住加密密钥',
+            hint: '开启后在本机缓存密钥',
           }, h('input', {
             type: 'checkbox',
             className: 'os-check',
@@ -771,13 +903,36 @@ window.__ModuleLoader__.load({
         ),
 
         h('div', { className: 'os-card' },
-          h('h3', null, '同步口令'),
-          h('div', { className: 'os-hint', style: { marginBottom: '8px' } },
-            '两台电脑必须输入同一口令。它只在本机用于生成/解开 key.enc；上传的状态文件全部是 AES-256-GCM 密文。' +
-            '第一次同步会用口令生成 key.enc，之后留空即可继续使用已保存的口令。'),
+          h('h3', null, '自动同步'),
           h(Row, {
-            title: '口令',
-            hint: '修改口令不会自动重加密远端密钥；如需更换，必须两台电脑一起重置 key.enc。',
+            title: '每轮结束后自动同步',
+            hint: '每轮对话结束后触发',
+          }, h('input', {
+            type: 'checkbox',
+            className: 'os-check',
+            checked: v('autoSync') === true,
+            onChange: function (event) { return patch('autoSync', event.target.checked); },
+          })),
+          h(Row, {
+            title: '延迟（秒）',
+            hint: '自动同步等待时间',
+          }, h(TextInput, {
+            number: true,
+            type: 'number',
+            min: 2,
+            max: 60,
+            value: v('autoSyncDelaySec'),
+            onChange: function (value) {
+              return patch('autoSyncDelaySec', value === '' ? '' : Number(value));
+            },
+          })),
+        ),
+
+        h('div', { className: 'os-card' },
+          h('h3', null, '加密'),
+          h(Row, {
+            title: '加密口令',
+            hint: '两台电脑必须一致',
           }, h(TextInput, {
             type: 'password',
             value: v('passphrase'),
@@ -787,21 +942,6 @@ window.__ModuleLoader__.load({
           })),
         ),
 
-        h('div', { className: 'os-card' },
-          h('h3', null, '同步范围与安全'),
-          h('ul', { className: 'os-list' },
-            h('li', null, '自动加密同步：~/.dsh/sessions、~/.dsh/storages、~/.dsh/memories。'),
-            h('li', null, 'Profile 配置：~/.dsh/profiles/<profile>/package.json、cordis.patch.yml，以及 ~/.dsh/settings.yaml。'),
-            h('li', null, 'workspace.json 的 path 会在 gitRoot 相对路径与本机绝对路径之间自动转换。'),
-            h('li', null, '加密：AES-256-GCM，确定性 IV；内容没变的文件不会产生新提交。'),
-            h('li', null, '冲突：会话双方都改且本机较新时保留本机，远端版本另存为 *.remote.jsonl.zstd。'),
-            h('li', null, '代码同步：自动提交未提交改动 → pull →（状态同步）→ push；冲突会中止合并，不强推。'),
-            h('li', null, '状态传输统一走 lib/rest.js 的 Git Data API。'),
-          ),
-          h('div', { className: 'os-hint', style: { marginTop: '8px' } },
-            '配置文件：' + ((st.status && st.status.configPath) || '~/.dsh/one-sync.json') +
-            '；Token 与口令均为本机明文保存，请确保本机账户安全。'),
-        ),
       );
     }
 
@@ -810,12 +950,17 @@ window.__ModuleLoader__.load({
       ctx.effect(installStyles, 'dsh-one-sync: styles');
 
       ctx.effect(function () {
+        syncStore.start();
+        return function () { syncStore.stop(); };
+      }, 'dsh-one-sync: shared status store');
+
+      ctx.effect(function () {
         return ctx.slots.inject('sidebar.footer.action', function () {
           return ctx.slots.register({
             name: 'sidebar.footer.action',
             id: 'dsh-one-sync',
             order: 5,
-            label: function () { return '一键同步'; },
+            label: function () { return '同步'; },
           }, function (props) { return h(SyncButton, props); });
         });
       }, 'dsh-one-sync: sidebar button');
@@ -826,7 +971,7 @@ window.__ModuleLoader__.load({
             name: 'settings.section',
             id: 'dsh-one-sync',
             order: 37,
-            label: function () { return '一键同步'; },
+            label: function () { return '同步'; },
           }, function (props) { return h(SettingsPage, props); });
         });
       }, 'dsh-one-sync: settings section');

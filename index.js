@@ -21,12 +21,15 @@
  *   POST /sync     执行一次完整同步
  */
 import fs from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { findGitRoot, runGit } from './lib/git.js'
 import {
   ConfigError,
   baselinePath,
   configPath,
+  indexPath,
   keyCachePath,
   keyEncPath,
   loadConfig,
@@ -41,12 +44,14 @@ import {
 import { DEFAULT_KDF, unwrapKey } from './lib/crypto.js'
 import { publishNewRepo } from './lib/github-publisher.js'
 import { migrateToMonorepo } from './lib/migrator.js'
-import { RestTransport, SyncError, describePaths, deviceName, pullState, pushState } from './lib/sync-core.js'
+import { RELEASE_REPO, previewRelease, releasePlugin } from './lib/release.js'
+import { RestTransport, SyncError, createTimings, describePaths, deviceName, pullState, pushState } from './lib/sync-core.js'
 
 export const name = 'dsh-one-sync'
 export const inject = []
 
 const API_PREFIX = '/dsh-one-sync/api'
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const MAX_BODY_BYTES = 256 * 1024
 const GIT_TIMEOUT_MS = 180_000
 
@@ -248,9 +253,9 @@ async function prepareCodeRepo(config, say, options = {}) {
   try {
     stat = await fs.stat(workspaceDir)
   } catch {
-    throw new SyncError('code', `代码目录不存在：${workspaceDir}`)
+    throw new SyncError('code', `Workspace Root 不存在：${workspaceDir}`)
   }
-  if (!stat.isDirectory()) throw new SyncError('code', `代码目录不是文件夹：${workspaceDir}`)
+  if (!stat.isDirectory()) throw new SyncError('code', `Workspace Root 不是文件夹：${workspaceDir}`)
 
   // 关键：从当前工作区向上寻找 .git 根目录；后续所有 Git 命令都在 gitRoot 执行。
   const rootResult = await findGitRoot(workspaceDir, { token: config.token })
@@ -259,7 +264,7 @@ async function prepareCodeRepo(config, say, options = {}) {
       'code',
       `当前工作区不在 Git 仓库中：${workspaceDir}\n` +
       `${rootResult.error || ''}\n` +
-      '请先在项目根目录执行 git init，或把 codeDir 指向一个已存在的 Git 仓库。',
+      '请把 Workspace Root 指向一个 Git 仓库。',
     )
   }
   const gitRoot = resolve(rootResult.root)
@@ -296,6 +301,16 @@ async function prepareCodeRepo(config, say, options = {}) {
     }
   }
   return { workspaceDir, gitRoot, branch, nested }
+}
+
+async function workspaceGitRoot(config) {
+  if (!config.codeDir) return ''
+  try {
+    const root = await findGitRoot(resolve(config.codeDir), { token: config.token })
+    return root.ok && root.root ? resolve(root.root) : ''
+  } catch {
+    return ''
+  }
 }
 
 async function commitDirtyWorktree(gitRoot, config, say) {
@@ -345,7 +360,7 @@ async function assertWorktreeReady(gitRoot, config, statusText) {
 
 async function pullCode(config, say) {
   const prepared = await prepareCodeRepo(config, say)
-  if (!prepared) return { ok: true, skipped: true, reason: '未配置代码目录' }
+  if (!prepared) return { ok: true, skipped: true, reason: '未配置 Workspace Root' }
   const { workspaceDir, gitRoot, branch, nested } = prepared
 
   try {
@@ -388,7 +403,7 @@ async function pullCode(config, say) {
 
 async function pushCode(config, say) {
   const prepared = await prepareCodeRepo(config, say, { notify: false })
-  if (!prepared) return { ok: true, skipped: true, reason: '未配置代码目录' }
+  if (!prepared) return { ok: true, skipped: true, reason: '未配置 Workspace Root' }
   const { workspaceDir, gitRoot, branch, nested } = prepared
 
   try {
@@ -429,7 +444,8 @@ async function pushCode(config, say) {
  * 一键同步。ctx 只要求可选的 status/success/error 回调，方便命令、HTTP、
  * 测试共用。返回结构化报告，供 Web API 原样回给界面。
  */
-export async function onSync(ctx = {}) {
+export async function onSync(ctx = {}, options = {}) {
+  const mode = options.mode === 'state-push' ? 'state-push' : 'full'
   const status = typeof ctx.status === 'function' ? ctx.status : () => {}
   const success = typeof ctx.success === 'function' ? ctx.success : () => {}
   const fail = typeof ctx.error === 'function' ? ctx.error : () => {}
@@ -442,29 +458,74 @@ export async function onSync(ctx = {}) {
 
   if (runtime.syncing) {
     const text = '同步正在进行中，请稍后再试。'
-    return { ok: false, busy: true, error: text, text, errors: [text], messages }
+    return { ok: false, busy: true, error: text, text, errors: [text], messages, timings: {} }
   }
 
   runtime.syncing = true
+  const timings = createTimings()
+  const syncStartedAt = performance.now()
   const report = {
     ok: false,
     at: new Date().toISOString(),
+    mode,
     code: {},
     state: {},
     errors: [],
     messages,
+    timings: {},
   }
   let config = null
+
+  const finalize = async () => {
+    report.ok = report.errors.length === 0
+    timings.record('Total', performance.now() - syncStartedAt)
+    report.timings = timings.snapshot()
+    report.text = describeReport(report)
+    runtime.lastSyncAt = report.at
+    runtime.lastError = report.ok ? null : report.errors.join('；')
+    runtime.lastReport = summarizeReport(report)
+    await writeStatus({
+      lastSyncAt: runtime.lastSyncAt,
+      lastError: runtime.lastError,
+      lastReport: runtime.lastReport,
+    }).catch(() => {})
+
+    if (report.ok) success(report.text)
+    else fail(report.text)
+    return report
+  }
 
   try {
     config = await loadConfig()
     const validation = validateForSync(config)
     if (validation.length) throw new SyncError('config', validation.join('；'))
 
+    if (mode === 'state-push') {
+      say('加密上传状态…')
+      let gitRoot = ''
+      try {
+        gitRoot = await workspaceGitRoot(config)
+      } catch { /* 没有 Git 根目录时仍可上传状态 */ }
+      try {
+        report.state.push = await timings.measure(
+          'State push',
+          () => pushState(config, { log: say, gitRoot, timings }),
+        )
+      } catch (error) {
+        report.state.push = {
+          ok: false,
+          code: error && error.code ? error.code : 'state',
+          error: redact(messageOf(error), config),
+        }
+        report.errors.push('状态上传：' + report.state.push.error)
+      }
+      return await finalize()
+    }
+
     // 1. Git Pull
     say('1/4 拉取代码…')
     try {
-      report.code.pull = await pullCode(config, say)
+      report.code.pull = await timings.measure('Git pull', () => pullCode(config, say))
     } catch (error) {
       report.code.pull = {
         ok: false,
@@ -482,16 +543,17 @@ export async function onSync(ctx = {}) {
     const codeUsable = !config.codeDir || Boolean(report.code.pull && report.code.pull.ok !== false)
     say('2/4 拉取 DSH 状态、合并工作区并补齐缺失目录…')
     try {
-      report.state.pull = await pullState(config, {
+      report.state.pull = await timings.measure('State pull', () => pullState(config, {
         log: say,
         gitRoot,
         branch,
+        timings,
         ensureWorkspaceDirs: async ({ workspaces }) => {
           if (!codeUsable || !gitRoot) {
             return {
               ok: true,
               skipped: true,
-              reason: '代码拉取未成功或未配置代码目录',
+              reason: '代码拉取未成功或未配置 Workspace Root',
               checked: 0,
               restored: 0,
               created: 0,
@@ -500,7 +562,7 @@ export async function onSync(ctx = {}) {
           }
           return restoreWorkspaceDirs(config, gitRoot, branch, workspaces, say)
         },
-      })
+      }))
       if (report.state.pull.skipped && report.state.pull.skipped.length) {
         say(`状态拉取：${report.state.pull.skipped.length} 个文件跳过（详见同步结果）`)
       }
@@ -518,12 +580,12 @@ export async function onSync(ctx = {}) {
       report.code.push = { ok: true, skipped: true, reason: '代码拉取失败，已跳过推送' }
       say('代码拉取失败，跳过代码推送')
     } else if (!config.codeDir) {
-      report.code.push = { ok: true, skipped: true, reason: '未配置代码目录' }
-      say('代码目录为空，跳过代码推送')
+      report.code.push = { ok: true, skipped: true, reason: '未配置 Workspace Root' }
+      say('Workspace Root 为空，跳过代码推送')
     } else {
       say('3/4 提交并推送代码…')
       try {
-        report.code.push = await pushCode(config, say)
+        report.code.push = await timings.measure('Git push', () => pushCode(config, say))
       } catch (error) {
         report.code.push = {
           ok: false,
@@ -549,7 +611,10 @@ export async function onSync(ctx = {}) {
     } else {
       say('4/4 加密并上传 DSH 状态…')
       try {
-        report.state.push = await pushState(config, { log: say, gitRoot })
+        report.state.push = await timings.measure(
+          'State push',
+          () => pushState(config, { log: say, gitRoot, timings }),
+        )
       } catch (error) {
         report.state.push = {
           ok: false,
@@ -560,25 +625,15 @@ export async function onSync(ctx = {}) {
       }
     }
 
-    report.ok = report.errors.length === 0
-    report.text = describeReport(report)
-    runtime.lastSyncAt = report.at
-    runtime.lastError = report.ok ? null : report.errors.join('；')
-    runtime.lastReport = summarizeReport(report)
-    await writeStatus({
-      lastSyncAt: runtime.lastSyncAt,
-      lastError: runtime.lastError,
-      lastReport: runtime.lastReport,
-    }).catch(() => {})
-
-    if (report.ok) success(report.text)
-    else fail(report.text)
-    return report
+    return await finalize()
   } catch (error) {
     const text = redact(messageOf(error), config)
     report.ok = false
     report.error = text
-    report.text = `同步失败：${text}`
+    timings.record('Total', performance.now() - syncStartedAt)
+    report.timings = timings.snapshot()
+    const timingText = formatTimings(report.timings)
+    report.text = `同步失败：${text}${timingText ? `；耗时：${timingText}` : ''}`
     report.errors.push(text)
     runtime.lastSyncAt = report.at
     runtime.lastError = text
@@ -595,26 +650,63 @@ export async function onSync(ctx = {}) {
   }
 }
 
+const TIMING_ORDER = [
+  'Git pull',
+  'State pull',
+  'Git push',
+  'State push',
+  'State scan',
+  'State prepare',
+  'State encrypt',
+  'Upload',
+  'Pull snapshot',
+  'Pull prepare',
+  'Prefetch',
+  'Total',
+]
+
+function formatDuration(ms) {
+  const value = Number(ms)
+  if (!Number.isFinite(value)) return ''
+  if (value < 1000) return `${Math.round(value)}ms`
+  const seconds = value / 1000
+  return `${seconds.toFixed(seconds >= 10 || Number.isInteger(seconds) ? 0 : 1)}s`
+}
+
+function formatTimings(timings) {
+  if (!timings || typeof timings !== 'object') return ''
+  const names = TIMING_ORDER.filter((name) => Object.prototype.hasOwnProperty.call(timings, name))
+  for (const name of Object.keys(timings)) {
+    if (!names.includes(name)) names.push(name)
+  }
+  return names
+    .map((name) => `${name}: ${formatDuration(timings[name])}`)
+    .filter((text) => !text.endsWith(': '))
+    .join(' / ')
+}
+
 function describeReport(report) {
   const parts = []
 
-  const codePull = report.code && report.code.pull
-  const codePush = report.code && report.code.push
-  if (codePull && codePull.nested && codePull.gitRoot) {
-    parts.push(`检测到嵌套子工作区，自动在根目录 ${codePull.gitRoot} 进行同步`)
-  }
-  if (codePull && codePull.skipped) {
-    parts.push('代码：未配置')
-  } else if (codePull && codePull.ok === false) {
-    parts.push('代码：拉取失败')
-  } else {
-    const bits = []
-    if (codePull && codePull.committed) bits.push('已提交本地改动')
-    if (codePull && codePull.pulled) bits.push('已拉取')
-    if (codePush && codePush.pushed) bits.push('已推送')
-    if (codePush && codePush.skipped) bits.push(codePush.reason || '跳过推送')
-    if (codePush && codePush.ok === false) bits.push('推送失败')
-    parts.push('代码：' + (bits.join(' / ') || '无变化'))
+  if (report.mode !== 'state-push') {
+    const codePull = report.code && report.code.pull
+    const codePush = report.code && report.code.push
+    if (codePull && codePull.nested && codePull.gitRoot) {
+      parts.push(`检测到嵌套子工作区，自动在根目录 ${codePull.gitRoot} 进行同步`)
+    }
+    if (codePull && codePull.skipped) {
+      parts.push('代码：未配置')
+    } else if (codePull && codePull.ok === false) {
+      parts.push('代码：拉取失败')
+    } else {
+      const bits = []
+      if (codePull && codePull.committed) bits.push('已提交本地改动')
+      if (codePull && codePull.pulled) bits.push('已拉取')
+      if (codePush && codePush.pushed) bits.push('已推送')
+      if (codePush && codePush.skipped) bits.push(codePush.reason || '跳过推送')
+      if (codePush && codePush.ok === false) bits.push('推送失败')
+      parts.push('代码：' + (bits.join(' / ') || '无变化'))
+    }
   }
 
   const statePull = report.state && report.state.pull
@@ -661,6 +753,9 @@ function describeReport(report) {
   }
   if (stateBits.length) parts.push('状态：' + stateBits.join('，'))
 
+  const timingText = formatTimings(report.timings)
+  if (timingText) parts.push('耗时：' + timingText)
+
   if (report.errors && report.errors.length) parts.push('错误：' + report.errors[0])
   return (report.ok ? '同步完成：' : '同步未完全成功：') + parts.join('；')
 }
@@ -671,6 +766,8 @@ function summarizeReport(report) {
   return {
     at: report.at,
     ok: report.ok,
+    mode: report.mode || 'full',
+    timings: report.timings || {},
     code: {
       pull: report.code && report.code.pull
         ? {
@@ -768,6 +865,9 @@ export async function statusSnapshot() {
     lastSyncAt: runtime.lastSyncAt || persisted.lastSyncAt || null,
     lastError: runtime.lastError || persisted.lastError || null,
     lastReport: runtime.lastReport || persisted.lastReport || null,
+    timings: (runtime.lastReport && runtime.lastReport.timings)
+      || (persisted.lastReport && persisted.lastReport.timings)
+      || null,
     api: {
       status: `${API_PREFIX}/status`,
       config: `${API_PREFIX}/config`,
@@ -804,7 +904,7 @@ async function verifyPassphrase(config, passphrase, options = {}) {
       }
     } catch (error) {
       warning = '暂时无法连接远端校验口令（' + redact(messageOf(error), config) + '），' +
-        (allowLocalFallback ? '已用本机 key.enc 校验。' : '已跳过校验，首次同步会再次校验。')
+        (allowLocalFallback ? '已用本机密钥校验。' : '已跳过校验，首次同步会再次校验。')
     }
   }
   if (!keyEncBuffer && allowLocalFallback) keyEncBuffer = await localKeyEnc()
@@ -824,6 +924,7 @@ async function resetLocalState() {
     fs.rm(keyCachePath(), { force: true }).catch(() => {}),
     fs.rm(keyEncPath(), { force: true }).catch(() => {}),
     fs.rm(baselinePath(), { force: true }).catch(() => {}),
+    fs.rm(indexPath(), { force: true }).catch(() => {}),
   ])
 }
 
@@ -832,7 +933,7 @@ async function saveConfigFromBody(body) {
   const current = await loadConfig()
 
   const candidateRaw = { ...current }
-  for (const key of ['codeDir', 'stateRepo', 'branch', 'deviceName', 'maxFileMb', 'rememberKey']) {
+  for (const key of ['codeDir', 'stateRepo', 'branch', 'deviceName', 'maxFileMb', 'rememberKey', 'autoSync', 'autoSyncDelaySec']) {
     if (src[key] !== undefined) candidateRaw[key] = src[key]
   }
   // 兼容旧设置页/旧脚本仍提交 remote 的情况。
@@ -859,8 +960,8 @@ async function saveConfigFromBody(body) {
     if (verdict.status === 'bad') {
       return {
         ok: false,
-        error: '这个口令解不开远端（或本机）的 key.enc。请确认两台电脑使用同一口令；' +
-          '如果确实忘记口令，需要两台电脑一起重置密钥。',
+        error: '这个口令无法解密备份。请确认两台电脑使用同一口令；' +
+          '如果忘记口令，需要两台电脑一起重置密钥。',
       }
     }
     if (verdict.warning) warning = verdict.warning
@@ -875,6 +976,8 @@ async function saveConfigFromBody(body) {
     deviceName: candidate.deviceName,
     maxFileMb: candidate.maxFileMb,
     rememberKey: candidate.rememberKey,
+    autoSync: candidate.autoSync,
+    autoSyncDelaySec: candidate.autoSyncDelaySec,
     kdf: candidate.kdf,
   })
 
@@ -882,7 +985,7 @@ async function saveConfigFromBody(body) {
     await resetLocalState()
     warning = [
       warning,
-      '状态仓库已变更：已清除本机旧密钥缓存与同步基线，下次同步会按新仓库的 key.enc 重新解锁。',
+      'Encrypted Backup 已变更：已清除本机旧密钥缓存与同步基线，下次同步会重新解锁。',
     ].filter(Boolean).join(' ')
   }
 
@@ -1022,7 +1125,7 @@ function installRoutes(webCtx) {
         return
       }
       if (!config.codeDir) {
-        sendJson(res, 400, { ok: false, error: '请先在设置中填写代码目录（codeDir）。' })
+        sendJson(res, 400, { ok: false, error: '请先在设置中填写 Workspace Root。' })
         return
       }
       if (!config.token) {
@@ -1046,7 +1149,7 @@ function installRoutes(webCtx) {
         sendJson(res, 200, {
           ...result,
           ok: true,
-          text: `已发布到 ${result.htmlUrl}；代码仓库与 stateRepo 已分离，状态仓库配置未修改。`,
+          text: `已发布到 ${result.htmlUrl}；代码仓库与 Encrypted Backup 已分离，备份配置未修改。`,
         })
       } catch (error) {
         const message = redact(messageOf(error), config)
@@ -1120,6 +1223,65 @@ function installRoutes(webCtx) {
     },
   })
 
+  install(`${API_PREFIX}/release/preview`, {
+    POST: async (req, res) => {
+      const body = await readJsonBody(req)
+      let config
+      try {
+        config = await loadConfig()
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: redact(messageOf(error), null) })
+        return
+      }
+      try {
+        const result = await previewRelease({
+          sourceDir: PLUGIN_DIR,
+          repo: RELEASE_REPO,
+          bump: body.bump,
+          token: config.token,
+          notes: body.notes,
+        })
+        sendJson(res, 200, result)
+      } catch (error) {
+        sendJson(res, 400, {
+          ok: false,
+          error: redact(messageOf(error), config),
+          code: error && error.code ? error.code : 'release',
+        })
+      }
+    },
+  })
+
+  install(`${API_PREFIX}/release/run`, {
+    POST: async (req, res) => {
+      const body = await readJsonBody(req)
+      let config
+      try {
+        config = await loadConfig()
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: redact(messageOf(error), null) })
+        return
+      }
+      try {
+        const result = await releasePlugin({
+          sourceDir: PLUGIN_DIR,
+          repo: RELEASE_REPO,
+          bump: body.bump,
+          token: config.token,
+          notes: body.notes,
+          confirm: body.confirm === true,
+        })
+        sendJson(res, 200, result)
+      } catch (error) {
+        sendJson(res, 400, {
+          ok: false,
+          error: redact(messageOf(error), config),
+          code: error && error.code ? error.code : 'release',
+        })
+      }
+    },
+  })
+
   install(`${API_PREFIX}/sync`, {
     POST: async (req, res) => {
       // 主动读完请求体：body 很小，但留着不读会让部分 HTTP 客户端复用连接时出问题。
@@ -1152,6 +1314,132 @@ export function apply(ctx) {
     )
     logInfo(ctx, `HTTP API 已挂载：${API_PREFIX}（配置 ${configPath()}）`)
   }
+
+  let autoTimer = null
+  let autoMaxTimer = null
+  let autoQueued = false
+  let autoRunning = false
+  let autoFailures = 0
+  let autoBackoffUntil = 0
+  let autoScheduleSeq = 0
+
+  function clearAutoTimers() {
+    if (autoTimer) {
+      clearTimeout(autoTimer)
+      autoTimer = null
+    }
+    if (autoMaxTimer) {
+      clearTimeout(autoMaxTimer)
+      autoMaxTimer = null
+    }
+  }
+
+  function setAutoTimer(delay) {
+    if (autoTimer) clearTimeout(autoTimer)
+    autoTimer = setTimeout(() => {
+      autoTimer = null
+      runAutoSync()
+    }, Math.max(50, delay))
+  }
+
+  async function queueAutoSync() {
+    const seq = ++autoScheduleSeq
+    let config
+    try {
+      config = await loadConfig()
+    } catch {
+      return
+    }
+    if (seq !== autoScheduleSeq || !config.autoSync) return
+    if (runtime.syncing || autoRunning) {
+      autoQueued = true
+      setAutoTimer(1000)
+      return
+    }
+    const now = Date.now()
+    if (now < autoBackoffUntil) {
+      setAutoTimer(Math.min(600000, autoBackoffUntil - now))
+      return
+    }
+    const delay = Math.max(2, Math.min(60, Number(config.autoSyncDelaySec) || 5)) * 1000
+    setAutoTimer(delay)
+    if (!autoMaxTimer) {
+      autoMaxTimer = setTimeout(() => {
+        autoMaxTimer = null
+        runAutoSync()
+      }, 30000)
+    }
+  }
+
+  async function runAutoSync() {
+    if (autoRunning) {
+      autoQueued = true
+      return
+    }
+    if (runtime.syncing) {
+      autoQueued = true
+      setAutoTimer(1000)
+      return
+    }
+    clearAutoTimers()
+    let config
+    try {
+      config = await loadConfig()
+    } catch {
+      return
+    }
+    if (!config.autoSync) return
+    const now = Date.now()
+    if (now < autoBackoffUntil) {
+      setAutoTimer(Math.min(600000, autoBackoffUntil - now))
+      return
+    }
+
+    autoQueued = false
+    autoRunning = true
+    try {
+      const report = await onSync({
+        status: (message) => logInfo(ctx, message),
+        success: (message) => logInfo(ctx, message),
+        error: (message) => logInfo(ctx, message),
+      }, { mode: 'state-push' })
+      if (report && report.busy) {
+        autoQueued = true
+        setAutoTimer(1000)
+      } else if (report && report.ok) {
+        autoFailures = 0
+        autoBackoffUntil = 0
+      } else {
+        autoFailures += 1
+        const waits = [30000, 120000, 600000]
+        autoBackoffUntil = Date.now() + waits[Math.min(autoFailures - 1, waits.length - 1)]
+      }
+    } catch {
+      autoFailures += 1
+      const waits = [30000, 120000, 600000]
+      autoBackoffUntil = Date.now() + waits[Math.min(autoFailures - 1, waits.length - 1)]
+    } finally {
+      autoRunning = false
+    }
+    if (autoQueued) {
+      autoQueued = false
+      queueAutoSync()
+    }
+  }
+
+  ctx.effect(function () {
+    if (typeof ctx.on !== 'function') return function () {}
+    const off = ctx.on('session/event', (_session, event) => {
+      if (event && event.type === 'turn/end') {
+        queueAutoSync().catch(() => {})
+      }
+    })
+    return function () {
+      autoScheduleSeq += 1
+      if (typeof off === 'function') off()
+      clearAutoTimers()
+    }
+  }, 'dsh-one-sync: auto sync')
 
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer'], (webCtx) => {
