@@ -316,11 +316,40 @@ async function workspaceGitRoot(config) {
   }
 }
 
+export async function ensureGitignore(gitRoot, say) {
+  const file = join(gitRoot, '.gitignore')
+  let current = ''
+  try {
+    current = await fs.readFile(file, 'utf8')
+  } catch {
+    current = ''
+  }
+  const wanted = ['node_modules/', '.DS_Store', 'dist/', 'build/', '*.log']
+  const normalized = new Set(current
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean))
+  const missing = wanted.filter((line) => {
+    const key = line.replace(/^\/+|\/+$/g, '')
+    return !normalized.has(key)
+  })
+  if (!missing.length) return false
+  const next = current + (current && !current.endsWith('\n') ? '\n' : '') + missing.join('\n') + '\n'
+  try {
+    await fs.writeFile(file, next, 'utf8')
+  } catch (error) {
+    throw new SyncError('code', `写入 .gitignore 失败：${messageOf(error)}`)
+  }
+  say('已补充 .gitignore 关键规则')
+  return true
+}
+
 async function commitDirtyWorktree(gitRoot, config, say) {
+  const ignoreChanged = await ensureGitignore(gitRoot, say)
   const status = await gitIn(gitRoot, config, ['status', '--porcelain'])
   if (!status.ok) throw new SyncError('code', `读取 Git 状态失败：${status.error}`)
   await assertWorktreeReady(gitRoot, config, status.stdout)
-  if (!status.stdout.trim()) return false
+  if (!status.stdout.trim() && !ignoreChanged) return false
 
   say('检测到未提交改动，先自动提交…')
   const add = await gitIn(gitRoot, config, ['add', '-A'])
@@ -361,7 +390,60 @@ async function assertWorktreeReady(gitRoot, config, statusText) {
   }
 }
 
+export async function ensureCodeRepo(config, say) {
+  if (!config.codeDir) return false
+  const dir = resolve(config.codeDir)
+  let stat = null
+  try {
+    stat = await fs.stat(dir)
+  } catch {
+    /* 新设备目录不存在 */
+  }
+  if (stat && !stat.isDirectory()) {
+    throw new SyncError('code', `Workspace Root 不是文件夹：${dir}`)
+  }
+  if (stat) {
+    const found = await findGitRoot(dir, { token: config.token })
+    if (found.ok && found.root) return false
+  }
+
+  const remote = String(config.codeRemote || '').trim()
+  if (!remote) return false
+  if (!stat) await fs.mkdir(dir, { recursive: true })
+
+  const branch = config.branch || 'main'
+  const initWithBranch = await gitIn(dir, config, ['init', '-b', branch])
+  if (!initWithBranch.ok) {
+    const init = await gitIn(dir, config, ['init'])
+    if (!init.ok) throw new SyncError('code', `初始化 Git 仓库失败：${init.error}`)
+    const checkout = await gitIn(dir, config, ['checkout', '-b', branch])
+    if (!checkout.ok && !/already exists/i.test(checkout.error || '')) {
+      throw new SyncError('code', `创建分支 ${branch} 失败：${checkout.error}`)
+    }
+  }
+
+  const currentRemote = await gitIn(dir, config, ['remote', 'get-url', 'origin'])
+  const remoteResult = currentRemote.ok
+    ? await gitIn(dir, config, ['remote', 'set-url', 'origin', remote])
+    : await gitIn(dir, config, ['remote', 'add', 'origin', remote])
+  if (!remoteResult.ok) {
+    throw new SyncError('code', `绑定代码仓库失败：${remoteResult.error}`)
+  }
+
+  const pulled = await gitIn(dir, config, ['pull', 'origin', branch])
+  if (!pulled.ok) {
+    if (missingRemoteRef(pulled.error)) {
+      say('远端分支为空，跳过拉取')
+    } else {
+      throw new SyncError('code', `拉取代码仓库失败：${pulled.error}`)
+    }
+  }
+  say(`已初始化代码仓库：${dir}`)
+  return true
+}
+
 async function pullCode(config, say) {
+  await ensureCodeRepo(config, say)
   const prepared = await prepareCodeRepo(config, say)
   if (!prepared) return { ok: true, skipped: true, reason: '未配置 Workspace Root' }
   const { workspaceDir, gitRoot, branch, nested } = prepared
@@ -1000,16 +1082,35 @@ export async function initializeFromBody(body = {}) {
   }
 }
 
-async function saveConfigFromBody(body) {
+async function verifyGitHubToken(config) {
+  if (!config.token || !config.stateRepo) return { ok: true, skipped: true }
+  try {
+    const rest = new GithubRest({
+      remote: config.stateRepo,
+      token: config.token,
+      branch: config.branch,
+    }, () => {})
+    const exists = await rest.repoExists()
+    return { ok: true, exists }
+  } catch (error) {
+    return { ok: false, error: messageOf(error) }
+  }
+}
+
+export async function saveConfigFromBody(body) {
   const src = body && typeof body === 'object' ? body : {}
   const current = await loadConfig()
 
   const candidateRaw = { ...current }
-  for (const key of ['codeDir', 'stateRepo', 'branch', 'deviceName', 'maxFileMb', 'rememberKey', 'autoSync', 'autoSyncDelaySec']) {
+  for (const key of ['codeDir', 'codeRemote', 'stateRepo', 'branch', 'deviceName', 'maxFileMb', 'rememberKey', 'autoSync', 'autoSyncDelaySec']) {
     if (src[key] !== undefined) candidateRaw[key] = src[key]
   }
-  // 兼容旧设置页/旧脚本仍提交 remote 的情况。
-  if (src.stateRepo === undefined && src.remote !== undefined) candidateRaw.stateRepo = src.remote
+  // 兼容旧脚本：remote 作为代码仓库地址；旧状态仓库别名仍保留。
+  if (src.codeRemote === undefined && src.remote !== undefined && src.stateRepo !== undefined) {
+    candidateRaw.codeRemote = src.remote
+  } else if (src.stateRepo === undefined && src.remote !== undefined) {
+    candidateRaw.stateRepo = src.remote
+  }
   if (src.clearToken === true) candidateRaw.token = ''
   else if (typeof src.token === 'string' && src.token.trim()) candidateRaw.token = src.token.trim()
   const passphrase = typeof src.passphrase === 'string' && src.passphrase !== ''
@@ -1026,21 +1127,11 @@ async function saveConfigFromBody(body) {
   }
 
   const stateRepoChanged = candidate.stateRepo !== current.stateRepo
-  let warning = ''
-  if (passphrase !== null) {
-    const verdict = await verifyPassphrase(candidate, passphrase, { allowLocalFallback: !stateRepoChanged })
-    if (verdict.status === 'bad') {
-      return {
-        ok: false,
-        error: '这个口令无法解密备份。请确认两台电脑使用同一口令；' +
-          '如果忘记口令，需要两台电脑一起重置密钥。',
-      }
-    }
-    if (verdict.warning) warning = verdict.warning
-  }
 
+  // 先落盘，再做网络校验。网络失败绝不能丢用户刚输入的 Token / 口令。
   const saved = await saveConfig({
     codeDir: candidate.codeDir,
+    codeRemote: candidate.codeRemote,
     stateRepo: candidate.stateRepo,
     token: candidate.token,
     passphrase: candidate.passphrase,
@@ -1053,16 +1144,39 @@ async function saveConfigFromBody(body) {
     kdf: candidate.kdf,
   })
 
+  let warning = ''
   if (stateRepoChanged) {
     await resetLocalState()
-    warning = [
-      warning,
-      'Encrypted Backup 已变更：已清除本机旧密钥缓存与同步基线，下次同步会重新解锁。',
-    ].filter(Boolean).join(' ')
+    warning = 'Encrypted Backup 已变更：已清除本机旧密钥缓存与同步基线，下次同步会重新解锁。'
+  }
+
+  const tokenCheck = await verifyGitHubToken(candidate)
+  if (!tokenCheck.ok) warning = '已保存本地，但 GitHub 连接失败'
+  const remoteReady = Boolean(tokenCheck.skipped || (tokenCheck.ok && tokenCheck.exists))
+
+  if (passphrase !== null && remoteReady) {
+    let verdict
+    try {
+      verdict = await verifyPassphrase(candidate, passphrase, { allowLocalFallback: !stateRepoChanged })
+    } catch {
+      warning = '已保存本地，但 GitHub 连接失败'
+    }
+    if (verdict && verdict.status === 'bad') {
+      return {
+        ok: false,
+        saved: true,
+        error: '已保存本地，但口令无法解密远端备份',
+        config: publicConfig(saved),
+        warning: warning || null,
+        stateRepoChanged,
+      }
+    }
+    if (verdict && verdict.warning) warning = '已保存本地，但 GitHub 连接失败'
   }
 
   return {
     ok: true,
+    saved: true,
     config: publicConfig(saved),
     warning: warning || null,
     stateRepoChanged,
@@ -1178,7 +1292,7 @@ function installRoutes(webCtx) {
     POST: async (req, res) => {
       const body = await readJsonBody(req)
       const result = await saveConfigFromBody(body)
-      sendJson(res, result.ok ? 200 : 400, result)
+      sendJson(res, result.ok || result.saved ? 200 : 400, result)
     },
   })
 

@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] - 2026-11-08
+
+### Fixed
+
+- Config is saved locally before GitHub validation, so failed checks no longer clear inputs.
+- New devices initialize and pull the configured code remote automatically.
+- `.gitignore` is populated before the first code commit.
+- Ghost plugins are removed when pulling a profile config.
+- Atomic writes retry transient Windows EPERM/BUSY failures.
+
 ## [1.2.0] - 2026-11-07
 
 ### Added

@@ -520,10 +520,11 @@ window.__ModuleLoader__.load({
       var migrateToken = migrateTokenState[0];
       var setMigrateToken = migrateTokenState[1];
 
-      var applyConfig = function (config) {
+      var applyConfig = function (config, keepSecrets) {
         var cfg = config || {};
         setForm({
           codeDir: cfg.codeDir || '',
+          codeRemote: cfg.codeRemote || '',
           stateRepo: cfg.stateRepo || '',
           branch: cfg.branch || 'main',
           deviceName: cfg.deviceName || '',
@@ -531,8 +532,8 @@ window.__ModuleLoader__.load({
           rememberKey: cfg.rememberKey !== false,
           autoSync: cfg.autoSync === true,
           autoSyncDelaySec: cfg.autoSyncDelaySec === undefined ? 5 : cfg.autoSyncDelaySec,
-          token: '',
-          passphrase: '',
+          token: keepSecrets && form ? form.token : '',
+          passphrase: keepSecrets && form ? form.passphrase : '',
         });
         setMeta({
           hasToken: Boolean(cfg.hasToken),
@@ -574,6 +575,7 @@ window.__ModuleLoader__.load({
         setBusy('save');
         var payload = {
           codeDir: form.codeDir,
+          codeRemote: form.codeRemote,
           stateRepo: form.stateRepo,
           branch: form.branch,
           deviceName: form.deviceName,
@@ -588,9 +590,17 @@ window.__ModuleLoader__.load({
         apiPost('/config', payload).then(function (result) {
           setBusy('');
           if (!result || result.ok === false) {
+            if (result && result.saved) {
+              setMsg({
+                kind: 'err',
+                text: result.error || '已保存本地，但校验失败',
+              });
+              syncStore.refresh();
+              return;
+            }
             throw new Error((result && result.error) || '保存失败');
           }
-          applyConfig(result.config || {});
+          applyConfig(result.config || {}, Boolean(result.warning));
           setMsg({
             kind: result.warning ? 'info' : 'ok',
             text: result.warning || '已保存',
@@ -616,6 +626,7 @@ window.__ModuleLoader__.load({
         setMsg({ kind: 'info', text: '正在初始化…' });
         apiPost('/init', {
           codeDir: form.codeDir,
+          codeRemote: form.codeRemote,
           stateRepo: form.stateRepo,
           token: form.token,
           passphrase: form.passphrase,
@@ -898,6 +909,14 @@ window.__ModuleLoader__.load({
             value: v('codeDir'),
             placeholder: 'D:\\项目\\仓库',
             onChange: function (value) { return patch('codeDir', value); },
+          })),
+          h(Row, {
+            title: '代码仓库地址',
+            hint: '留空使用本地仓库',
+          }, h(TextInput, {
+            value: v('codeRemote'),
+            placeholder: 'https://github.com/<用户名>/<仓库名>.git',
+            onChange: function (value) { return patch('codeRemote', value); },
           })),
           h(Row, {
             title: '加密备份仓库',
