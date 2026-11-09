@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Workspace migration now preserves and repairs absolute junctions/symlinks.
+- Profile `node_modules` links pointing into a migrated workspace are retargeted.
+- Migration warns when `node_modules` or nested `.git` may break links.
+
 ## [1.3.0] - 2026-11-08
 
 ### Fixed
