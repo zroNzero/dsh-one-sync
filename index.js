@@ -584,6 +584,10 @@ export async function onSync(ctx = {}, options = {}) {
     config = await loadConfig()
     const validation = validateForSync(config)
     if (validation.length) throw new SyncError('config', validation.join('；'))
+    const chatOnly = config.stateOnly === true
+    const stateOptions = (base) => (chatOnly
+      ? { ...base, chatOnly: true, groups: ['sessions'] }
+      : base)
 
     if (mode === 'state-push') {
       say('加密上传状态…')
@@ -594,7 +598,7 @@ export async function onSync(ctx = {}, options = {}) {
       try {
         report.state.push = await timings.measure(
           'State push',
-          () => pushState(config, { log: say, gitRoot, timings }),
+          () => pushState(config, stateOptions({ log: say, gitRoot, timings })),
         )
       } catch (error) {
         report.state.push = {
@@ -608,18 +612,33 @@ export async function onSync(ctx = {}, options = {}) {
     }
 
     // 1. Git Pull
-    say('1/4 拉取代码…')
-    try {
-      report.code.pull = await timings.measure('Git pull', () => pullCode(config, say))
-    } catch (error) {
-      report.code.pull = {
-        ok: false,
-        code: error && error.code ? error.code : 'code',
-        error: redact(messageOf(error), config),
-        gitRoot: error && error.gitRoot ? error.gitRoot : '',
-        nested: Boolean(error && error.nested),
+    if (chatOnly) {
+      let root = ''
+      if (config.codeDir) {
+        try { root = await workspaceGitRoot(config) } catch { root = '' }
       }
-      report.errors.push('代码拉取：' + report.code.pull.error)
+      report.code.pull = {
+        ok: true,
+        skipped: true,
+        reason: '仅同步对话记录，不拉取代码',
+        gitRoot: root,
+        branch: config.branch,
+      }
+      say('仅同步对话记录，跳过代码仓库')
+    } else {
+      say('1/4 拉取代码…')
+      try {
+        report.code.pull = await timings.measure('Git pull', () => pullCode(config, say))
+      } catch (error) {
+        report.code.pull = {
+          ok: false,
+          code: error && error.code ? error.code : 'code',
+          error: redact(messageOf(error), config),
+          gitRoot: error && error.gitRoot ? error.gitRoot : '',
+          nested: Boolean(error && error.nested),
+        }
+        report.errors.push('代码拉取：' + report.code.pull.error)
+      }
     }
 
     // 2. 拉取状态、合并工作区，并从代码大仓补齐缺失目录
@@ -633,6 +652,8 @@ export async function onSync(ctx = {}, options = {}) {
         gitRoot,
         branch,
         timings,
+        chatOnly,
+        groups: chatOnly ? ['sessions'] : undefined,
         ensureWorkspaceDirs: async ({ workspaces }) => {
           if (!codeUsable || !gitRoot) {
             return {
@@ -664,6 +685,9 @@ export async function onSync(ctx = {}, options = {}) {
     if (report.code.pull && report.code.pull.ok === false) {
       report.code.push = { ok: true, skipped: true, reason: '代码拉取失败，已跳过推送' }
       say('代码拉取失败，跳过代码推送')
+    } else if (chatOnly) {
+      report.code.push = { ok: true, skipped: true, reason: '仅同步对话记录，不推送代码' }
+      say('仅同步对话记录，跳过代码推送')
     } else if (!config.codeDir) {
       report.code.push = { ok: true, skipped: true, reason: '未配置 Workspace Root' }
       say('Workspace Root 为空，跳过代码推送')
@@ -698,7 +722,7 @@ export async function onSync(ctx = {}, options = {}) {
       try {
         report.state.push = await timings.measure(
           'State push',
-          () => pushState(config, { log: say, gitRoot, timings }),
+          () => pushState(config, stateOptions({ log: say, gitRoot, timings })),
         )
       } catch (error) {
         report.state.push = {
@@ -1102,7 +1126,7 @@ export async function saveConfigFromBody(body) {
   const current = await loadConfig()
 
   const candidateRaw = { ...current }
-  for (const key of ['codeDir', 'codeRemote', 'stateRepo', 'branch', 'deviceName', 'maxFileMb', 'rememberKey', 'autoSync', 'autoSyncDelaySec']) {
+  for (const key of ['codeDir', 'codeRemote', 'stateRepo', 'branch', 'deviceName', 'maxFileMb', 'rememberKey', 'autoSync', 'autoSyncDelaySec', 'stateOnly']) {
     if (src[key] !== undefined) candidateRaw[key] = src[key]
   }
   // 兼容旧脚本：remote 作为代码仓库地址；旧状态仓库别名仍保留。
@@ -1141,6 +1165,7 @@ export async function saveConfigFromBody(body) {
     rememberKey: candidate.rememberKey,
     autoSync: candidate.autoSync,
     autoSyncDelaySec: candidate.autoSyncDelaySec,
+    stateOnly: candidate.stateOnly,
     kdf: candidate.kdf,
   })
 

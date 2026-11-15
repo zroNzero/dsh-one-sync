@@ -2,7 +2,11 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [1.4.0] - 2026-11-15
+
+### Added
+
+- “只同步对话记录”开关：勾选后只读写加密状态仓库，只同步 sessions 与 workspace.json，代码仓库字段变灰不可填。
 
 ### Fixed
 

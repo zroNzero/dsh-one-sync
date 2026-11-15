@@ -331,6 +331,7 @@ window.__ModuleLoader__.load({
       'border-color:var(--dsw-alias-brand-primary,#0969da);color:#fff;}',
       '.os-btn.danger{color:var(--dsw-alias-state-error-primary,#cf222e);}',
       '.os-btn:disabled{opacity:.5;cursor:default;}',
+      '.os-input:disabled{opacity:.45;cursor:not-allowed;}',
       '.os-publish-panel{margin-top:10px;padding:10px;border:1px dashed var(--dsw-alias-border-l1,#d0d7de);',
       'border-radius:8px;display:flex;flex-direction:column;gap:8px;',
       'background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.04));}',
@@ -441,6 +442,7 @@ window.__ModuleLoader__.load({
         max: props.max,
         step: props.step,
         onKeyDown: props.onKeyDown,
+        disabled: props.disabled === true,
         onChange: function (event) { props.onChange(event.target.value); },
       });
     }
@@ -531,6 +533,7 @@ window.__ModuleLoader__.load({
           maxFileMb: cfg.maxFileMb === undefined ? 45 : cfg.maxFileMb,
           rememberKey: cfg.rememberKey !== false,
           autoSync: cfg.autoSync === true,
+          stateOnly: cfg.stateOnly === true,
           autoSyncDelaySec: cfg.autoSyncDelaySec === undefined ? 5 : cfg.autoSyncDelaySec,
           token: keepSecrets && form ? form.token : '',
           passphrase: keepSecrets && form ? form.passphrase : '',
@@ -583,6 +586,7 @@ window.__ModuleLoader__.load({
           rememberKey: form.rememberKey !== false,
           autoSync: form.autoSync === true,
           autoSyncDelaySec: Number(form.autoSyncDelaySec) || 5,
+          stateOnly: form.stateOnly === true,
         };
         if (form.token.trim()) payload.token = form.token.trim();
         if (form.passphrase !== '') payload.passphrase = form.passphrase;
@@ -903,19 +907,30 @@ window.__ModuleLoader__.load({
         h('div', { className: 'os-card' },
           h('h3', null, '工作区与备份'),
           h(Row, {
+            title: '只同步对话记录',
+            hint: '只读写加密仓库，不碰代码',
+          }, h('input', {
+            type: 'checkbox',
+            className: 'os-check',
+            checked: v('stateOnly') === true,
+            onChange: function (event) { return patch('stateOnly', event.target.checked); },
+          })),
+          h(Row, {
             title: '工作区根目录',
-            hint: '本地大仓的绝对路径',
+            hint: v('stateOnly') === true ? '已启用只同步对话，无需填写' : '本地大仓的绝对路径',
           }, h(TextInput, {
             value: v('codeDir'),
             placeholder: 'D:\\项目\\仓库',
+            disabled: v('stateOnly') === true,
             onChange: function (value) { return patch('codeDir', value); },
           })),
           h(Row, {
             title: '代码仓库地址',
-            hint: '留空使用本地仓库',
+            hint: v('stateOnly') === true ? '已启用只同步对话，无需填写' : '留空使用本地仓库',
           }, h(TextInput, {
             value: v('codeRemote'),
             placeholder: 'https://github.com/<用户名>/<仓库名>.git',
+            disabled: v('stateOnly') === true,
             onChange: function (value) { return patch('codeRemote', value); },
           })),
           h(Row, {
