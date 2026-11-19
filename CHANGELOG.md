@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.0] - 2026-11-19
+
+### Fixed
+
+- 手机端（无 Git 大仓）只同步对话记录时无法下载：工作区路径以 `$DSH_HOME/workspaces` 为基准还原，会话 header 的 cwd 正常重映射。
+
 ## [1.4.0] - 2026-11-15
 
 ### Added
