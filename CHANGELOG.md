@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.0] - 2026-11-22
+
+### Fixed
+
+- 状态上传 422（input too large）：单个状态文件超过 12MB 时按 `*.dshx.partNNN` 分片上传，manifest 记录 `parts`，拉取端自动按序拼接还原，不再依赖本地克隆和 `git push`（该通道在受限网络下会 `curl 55` 卡死）。
+
 ## [1.6.1] - 2026-11-22
 
 ### Fixed
