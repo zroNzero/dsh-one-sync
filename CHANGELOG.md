@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.0] - 2026-11-22
+
+### Fixed
+
+- 状态上传遇到超大文件（单个会话约 40MB）时不再被 GitHub 422 拒绝：超过 20MB 的状态文件改走本地克隆 + `git push`，仓库缓存在 `~/.dsh/one-sync/state-repo`。
+- 代码推送遇到 `curl 55`、连接重置、`RPC failed` 时自动重试 3 次，并调大 `http.postBuffer`、固定 HTTP/1.1。
+
 ## [1.5.0] - 2026-11-19
 
 ### Fixed

@@ -486,6 +486,28 @@ async function pullCode(config, say) {
   }
 }
 
+const TRANSIENT_PUSH_RE =
+  /curl (18|55|56)|RPC failed|onnection (reset|was reset)|early EOF|remote end hung up|timed out|502|503/i
+
+/** 网络抖动（curl 55 / 连接被重置）时重试，别让一次断线毁掉整轮同步。 */
+async function pushWithRetry(gitRoot, config, branch, say) {
+  let last = null
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    last = await gitIn(gitRoot, config, [
+      '-c', 'http.postBuffer=524288000',
+      '-c', 'http.version=HTTP/1.1',
+      'push', 'origin', branch,
+    ])
+    if (last.ok) return last
+    if (!TRANSIENT_PUSH_RE.test(last.error || '')) return last
+    if (attempt < 3) {
+      say(`推送中断，${attempt * 2} 秒后重试（${attempt}/3）…`)
+      await new Promise((resolve) => setTimeout(resolve, attempt * 2000))
+    }
+  }
+  return last
+}
+
 async function pushCode(config, say) {
   const prepared = await prepareCodeRepo(config, say, { notify: false })
   if (!prepared) return { ok: true, skipped: true, reason: '未配置 Workspace Root' }
@@ -496,7 +518,7 @@ async function pushCode(config, say) {
     await commitDirtyWorktree(gitRoot, config, say)
 
     say(`推送代码（${gitRoot}，origin/${branch}）…`)
-    let pushed = await gitIn(gitRoot, config, ['push', 'origin', branch])
+    let pushed = await pushWithRetry(gitRoot, config, branch, say)
     let recovered = false
     if (!pushed.ok && /non-fast-forward|fetch first|\[rejected\]|behind/i.test(pushed.error || '')) {
       say('远端代码领先，先 rebase 再重试推送…')
