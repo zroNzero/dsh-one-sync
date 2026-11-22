@@ -1,7 +1,7 @@
 {
   "name": "dsh-one-sync",
   "version": "1.6.0",
-  "description": "DSH 涓€閿悓姝ワ細Git 浠ｇ爜鎷夊彇/鎺ㄩ€?+ DSH 鐘舵€侊紙sessions/storages/memories锛夊姞瀵嗕笂浼?鎷夊彇锛涗晶鏍忔寜閽笌璁剧疆椤甸厤缃€?,
+  "description": "DSH 一键同步：Git 代码拉取/推送 + DSH 状态（sessions/storages/memories）加密上传/拉取；侧栏按钮与设置页配置。",
   "type": "module",
   "main": "./index.js",
   "exports": {
