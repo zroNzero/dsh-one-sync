@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.1] - 2026-11-22
+
+### Fixed
+
+- 超大状态文件的本地克隆缓存损坏或残留时（上次克隆中断），自动清理后重新克隆，不再报 “destination path already exists”。
+
 ## [1.6.0] - 2026-11-22
 
 ### Fixed
