@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.1] - 2026-11-22
+
+### Fixed
+
+- 浏览器能访问 GitHub、同步却报 `Recv failure: Connection was reset` / `Failed to connect to github.com port 443`：原因是浏览器走 Windows 系统代理（注册表 `ProxyEnable`/`ProxyServer`），而 git 和 Node 默认直连。现在启动时探测系统代理，git 命令注入 `-c http.proxy`/`-c https.proxy`，Node fetch 注入 `HTTPS_PROXY`/`NODE_USE_ENV_PROXY`。
+- 代码拉取遇到连接重置时同样重试 3 次（之前只有推送有重试）。
+
 ## [1.7.0] - 2026-11-22
 
 ### Fixed

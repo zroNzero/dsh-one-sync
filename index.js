@@ -26,6 +26,7 @@ import { performance } from 'node:perf_hooks'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findGitRoot, runGit } from './lib/git.js'
+import { initProxy } from './lib/proxy.js'
 import {
   ConfigError,
   baselinePath,
@@ -452,11 +453,11 @@ async function pullCode(config, say) {
     const committed = await commitDirtyWorktree(gitRoot, config, say)
 
     say(`拉取代码（${gitRoot}，origin/${branch}）…`)
-    const fastForward = await gitIn(gitRoot, config, ['pull', '--ff-only', 'origin', branch])
+    const fastForward = await pullWithRetry(gitRoot, config, branch, say, '--ff-only')
     let pulled = fastForward.ok
     let note = ''
     if (!fastForward.ok) {
-      const rebase = await gitIn(gitRoot, config, ['pull', '--rebase', 'origin', branch])
+      const rebase = await pullWithRetry(gitRoot, config, branch, say, '--rebase')
       if (rebase.ok) {
         pulled = true
       } else {
@@ -508,6 +509,23 @@ async function pushWithRetry(gitRoot, config, branch, say) {
   return last
 }
 
+async function pullWithRetry(gitRoot, config, branch, say, mode) {
+  const args = ['pull', mode, 'origin', branch]
+  let last = null
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    last = await gitIn(gitRoot, config, args)
+    if (last.ok) return last
+    if (!/Connection was reset|Could not connect|curl|RPC failed|timed out|early EOF|unexpected disconnect/i.test(last.error || '')) {
+      return last
+    }
+    if (attempt < 3) {
+      say(`拉取失败（第 ${attempt} 次），2 秒后重试…`)
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+    }
+  }
+  return last
+}
+
 async function pushCode(config, say) {
   const prepared = await prepareCodeRepo(config, say, { notify: false })
   if (!prepared) return { ok: true, skipped: true, reason: '未配置 Workspace Root' }
@@ -522,7 +540,7 @@ async function pushCode(config, say) {
     let recovered = false
     if (!pushed.ok && /non-fast-forward|fetch first|\[rejected\]|behind/i.test(pushed.error || '')) {
       say('远端代码领先，先 rebase 再重试推送…')
-      const rebase = await gitIn(gitRoot, config, ['pull', '--rebase', 'origin', branch])
+      const rebase = await pullWithRetry(gitRoot, config, branch, say, '--rebase')
       if (!rebase.ok) {
         await gitIn(gitRoot, config, ['rebase', '--abort'])
         throw new SyncError(
@@ -1548,6 +1566,14 @@ function installRoutes(webCtx) {
 // ── 插件入口 ─────────────────────────────────────────────────────────────
 
 export function apply(ctx) {
+  // 让 git 和内置 fetch 都走与浏览器相同的代理，否则会出现
+  // “浏览器能开 GitHub，同步却报 Connection was reset”。
+  initProxy()
+    .then((url) => {
+      if (url) logInfo(ctx, `已启用系统代理：${url}`)
+    })
+    .catch(() => {})
+
   const mount = (webCtx) => {
     webCtx.effect(
       () => installRoutes(webCtx),
